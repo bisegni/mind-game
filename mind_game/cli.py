@@ -15,13 +15,12 @@ from .onboarding import (
     build_onboarding_prompt_state,
     build_onboarding_seed_scene,
     normalize_onboarding_setup,
-    should_complete_onboarding,
+    required_field_from_setup,
+    required_field_prompt,
+    REQUIRED_ONBOARDING_FIELDS,
 )
 from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
 from .story_state import OnboardingSessionRecord, StoryStateStore
-
-
-MAX_ONBOARDING_EXCHANGES = 2
 
 
 @dataclass(slots=True)
@@ -216,6 +215,7 @@ def _choose_onboarding_session(
     if onboarding_session is None:
         onboarding_session = story_store.create_onboarding_session(
             selected_session.id,
+            question_order=REQUIRED_ONBOARDING_FIELDS,
             status="in_progress",
         )
     return selected_session.id, onboarding_session
@@ -225,6 +225,7 @@ def _create_new_onboarding_session(story_store: StoryStateStore) -> tuple[int | 
     session_id = story_store.create_session(status="onboarding")
     onboarding_session = story_store.create_onboarding_session(
         session_id,
+        question_order=REQUIRED_ONBOARDING_FIELDS,
         status="in_progress",
     )
     return session_id, onboarding_session
@@ -257,12 +258,9 @@ def _run_onboarding_chat(
 
     while True:
         snapshot = build_onboarding_prompt_state(current_session)
-        decision = onboarding_reasoner.decide(snapshot)
-
-        if decision.kind == "question" and should_complete_onboarding(snapshot):
-            merged_setup = dict(current_session.normalized_setup)
-            merged_setup.update(decision.updates)
-            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
+        missing_field = required_field_from_setup(snapshot)
+        if missing_field is None:
+            normalized_setup = normalize_onboarding_setup(current_session.normalized_setup, question_order=REQUIRED_ONBOARDING_FIELDS)
             seed_scene = build_onboarding_seed_scene(
                 normalized_setup,
                 session_id=current_session.session_id,
@@ -276,24 +274,10 @@ def _run_onboarding_chat(
             )
             return completed.session_id
 
-        if decision.kind == "complete":
-            merged_setup = dict(current_session.normalized_setup)
-            merged_setup.update(decision.setup)
-            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
-            seed_scene = build_onboarding_seed_scene(
-                normalized_setup,
-                session_id=current_session.session_id,
-                onboarding_id=current_session.id,
-            )
-            completed = story_store.complete_onboarding_session(
-                current_session.id,
-                normalized_setup=normalized_setup,
-                generated_summary_text=decision.content,
-                seed_scene=seed_scene,
-            )
-            return completed.session_id
-
-        question_text = decision.content.strip() or "What should we define next?"
+        attempt_count = sum(1 for answer in current_session.answers if answer.question_key == missing_field)
+        question_text = onboarding_reasoner.next_question(snapshot, missing_field=missing_field, attempt_count=attempt_count).strip()
+        if not question_text:
+            question_text = required_field_prompt(missing_field, attempt_count=attempt_count)
         stream_message(
             ConsoleMessage(
                 role="narrator",
@@ -304,45 +288,58 @@ def _run_onboarding_chat(
         )
         answer = input("Player > ").strip()
         if not answer:
-            print("Please say a little more so I can shape the opening.")
+            stream_message(
+                ConsoleMessage(
+                    role="narrator",
+                    content=required_field_prompt(missing_field, attempt_count=attempt_count + 1),
+                    turn_number=len(current_session.answers),
+                    created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
             continue
 
-        answer_index = len(current_session.answers)
-        normalized_answer = {
-            "assistant_question": question_text,
-            "user_answer": answer,
-            "updates": dict(decision.updates),
-        }
-        story_store.record_onboarding_answer(
-            current_session.id,
-            question_key=f"exchange_{answer_index + 1}",
-            question_text=question_text,
-            answer_index=answer_index,
-            raw_answer_text=answer,
-            normalized_answer=normalized_answer,
-        )
-
+        extracted_updates = onboarding_reasoner.extract_updates(snapshot, answer_text=answer, asked_field=missing_field)
         merged_setup = dict(current_session.normalized_setup)
-        merged_setup.update(decision.updates)
-        normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
+        if extracted_updates:
+            merged_setup.update(extracted_updates)
+            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=REQUIRED_ONBOARDING_FIELDS)
+            answer_index = len(current_session.answers)
+            for offset, field in enumerate(REQUIRED_ONBOARDING_FIELDS):
+                if field not in extracted_updates:
+                    continue
+                story_store.record_onboarding_answer(
+                    current_session.id,
+                    question_key=field,
+                    question_text=required_field_prompt(field, attempt_count=answer_index + offset),
+                    answer_index=answer_index + offset,
+                    raw_answer_text=answer,
+                    normalized_answer={field: extracted_updates[field]},
+                )
+            if missing_field not in extracted_updates:
+                story_store.record_onboarding_answer(
+                    current_session.id,
+                    question_key=missing_field,
+                    question_text=question_text,
+                    answer_index=answer_index + len(extracted_updates),
+                    raw_answer_text=answer,
+                    normalized_answer={},
+                )
+        else:
+            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=REQUIRED_ONBOARDING_FIELDS)
+            story_store.record_onboarding_answer(
+                current_session.id,
+                question_key=missing_field,
+                question_text=question_text,
+                answer_index=len(current_session.answers),
+                raw_answer_text=answer,
+                normalized_answer={},
+            )
         current_session = story_store.update_onboarding_session(
             current_session.id,
             status="in_progress",
             normalized_setup=normalized_setup,
+            question_order=REQUIRED_ONBOARDING_FIELDS,
         )
-
-        if len(current_session.answers) >= MAX_ONBOARDING_EXCHANGES:
-            completed = story_store.complete_onboarding_session(
-                current_session.id,
-                normalized_setup=normalized_setup,
-                generated_summary_text=_fallback_onboarding_completion_text(normalized_setup),
-                seed_scene=build_onboarding_seed_scene(
-                    normalized_setup,
-                    session_id=current_session.session_id,
-                    onboarding_id=current_session.id,
-                ),
-            )
-            return completed.session_id
 
 
 def _fallback_onboarding_completion_text(normalized_setup: Mapping[str, Any]) -> str:
@@ -350,12 +347,15 @@ def _fallback_onboarding_completion_text(normalized_setup: Mapping[str, Any]) ->
     genre = str(normalized_setup.get("genre") or "").strip()
     tone = str(normalized_setup.get("tone") or "").strip()
     setting = str(normalized_setup.get("setting") or "").strip()
+    player_role = str(normalized_setup.get("player_role") or "").strip()
     if genre:
         parts.append(f"This will be a {genre} story.")
     if tone:
         parts.append(f"It should feel {tone}.")
     if setting:
         parts.append(f"It begins in {setting}.")
+    if player_role:
+        parts.append(f"You will play as {player_role}.")
     return " ".join(parts)
 
 

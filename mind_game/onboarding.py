@@ -64,7 +64,8 @@ _QUESTIONNAIRE: tuple[OnboardingQuestion, ...] = (
     ),
 )
 
-_STARTING_FIELDS = ("genre", "tone", "setting")
+REQUIRED_ONBOARDING_FIELDS = ("genre", "tone", "setting", "player_role")
+_STARTING_FIELDS = REQUIRED_ONBOARDING_FIELDS
 _ADDITIONAL_FIELDS = ("player_role", "campaign_goal", "difficulty", "must_have_constraints", "must_avoid_constraints")
 
 
@@ -124,11 +125,12 @@ def _coerce_message_text(value: Any, fallback: str) -> str:
 
 def _fallback_onboarding_question(snapshot: Mapping[str, Any]) -> str:
     coverage = snapshot.get("coverage", {})
-    starting_fields = coverage.get("starting_fields", {}) if isinstance(coverage, Mapping) else {}
+    starting_fields = coverage.get("required_fields", {}) if isinstance(coverage, Mapping) else {}
     labels = {
         "genre": "genre",
         "tone": "tone",
         "setting": "setting",
+        "player_role": "player role",
     }
     missing: list[str] = []
     if isinstance(starting_fields, Mapping):
@@ -137,12 +139,12 @@ def _fallback_onboarding_question(snapshot: Mapping[str, Any]) -> str:
                 missing.append(labels.get(str(key), str(key)))
 
     if not missing:
-        return "I have the core idea. I’m filling in the rest now."
+        return "I have what I need from the core story."
     if len(missing) == 1:
         return f"Tell me a little more about the story's {missing[0]}."
     if len(missing) == 2:
         return f"Tell me a little more about the story's {missing[0]} and {missing[1]}."
-    return "Tell me a little more about the story's genre, tone, or starting setup."
+    return "Tell me a little more about the story's genre, tone, setting, or player role."
 
 
 def _fallback_completion_message(snapshot: Mapping[str, Any], setup: Mapping[str, Any]) -> str:
@@ -188,9 +190,10 @@ def build_onboarding_prompt_state(onboarding: Any) -> dict[str, Any]:
     ]
     current_setup = dict(getattr(onboarding, "normalized_setup", {}))
     coverage = {
-        "starting_fields": {field: bool(current_setup.get(field)) for field in _STARTING_FIELDS},
+        "required_fields": {field: bool(current_setup.get(field)) for field in REQUIRED_ONBOARDING_FIELDS},
+        "starting_fields": {field: bool(current_setup.get(field)) for field in REQUIRED_ONBOARDING_FIELDS},
         "additional_fields": {field: bool(current_setup.get(field)) for field in _ADDITIONAL_FIELDS},
-        "ready_to_start": all(current_setup.get(field) for field in _STARTING_FIELDS),
+        "ready_to_start": all(current_setup.get(field) for field in REQUIRED_ONBOARDING_FIELDS),
     }
     return {
         "onboarding_id": getattr(onboarding, "id", None),
@@ -211,38 +214,166 @@ def build_onboarding_system_prompt() -> str:
             "You are the onboarding guide for Mind Game.",
             "Keep the conversation natural and ask at most one concise follow-up question at a time.",
             "Do not use a rigid survey or a fixed question order.",
-            "Your goal is to gather only the core story triad: genre, tone, and starting situation.",
-            "Infer the player role, campaign goal, opening hook, and first event yourself once the core triad is clear.",
-            "Do not ask for the campaign goal, opening hook, or first event unless the user explicitly wants to define them.",
-            "Treat broad player directions, mood words, or requests like 'surprise me' as enough to finish.",
-            "When the core triad is present, stop asking questions and return a complete setup.",
-            "After at most two player replies, stop asking and complete the setup with what you have.",
-            "Return JSON only as either {\"kind\":\"question\",\"content\":\"...\",\"updates\":{...}} or {\"kind\":\"complete\",\"content\":\"...\",\"setup\":{...}}.",
+            "Your goal is to gather only the required story fields: genre, tone, setting, and player role.",
+            "The story cannot start until all four required fields are explicit.",
+            "Do not ask for campaign goal, opening hook, or first event during onboarding.",
+            "Ask again, more clearly, if the player does not explicitly provide the required field.",
+            "Return JSON only as {\"content\":\"...\"} for questions or {\"updates\":{...}} for extraction.",
             "Keep the content short and friendly.",
         ],
     )
 
 
-def build_onboarding_turn_prompt(snapshot: Mapping[str, Any]) -> str:
+def build_onboarding_question_prompt(snapshot: Mapping[str, Any], *, missing_field: str, attempt_count: int = 0) -> str:
     payload = {
+        "missing_field": missing_field,
+        "attempt_count": attempt_count,
         "current_setup": snapshot.get("normalized_setup", {}),
         "coverage": snapshot.get("coverage", {}),
         "recent_answers": snapshot.get("recent_answers", []),
-        "answer_count": snapshot.get("answer_count", 0),
-        "generated_summary_text": snapshot.get("generated_summary_text", ""),
-        "seed_scene": snapshot.get("seed_scene", {}),
     }
-    return f"Onboarding state: {json.dumps(payload, sort_keys=True)}"
+    return f"Ask for the missing field as a narrator: {json.dumps(payload, sort_keys=True)}"
+
+
+def build_onboarding_extraction_prompt(
+    snapshot: Mapping[str, Any],
+    *,
+    asked_field: str,
+    answer_text: str,
+) -> str:
+    payload = {
+        "asked_field": asked_field,
+        "answer_text": answer_text,
+        "current_setup": snapshot.get("normalized_setup", {}),
+        "coverage": snapshot.get("coverage", {}),
+    }
+    return f"Extract only explicit onboarding fields: {json.dumps(payload, sort_keys=True)}"
 
 
 def should_complete_onboarding(snapshot: Mapping[str, Any]) -> bool:
     coverage = snapshot.get("coverage", {})
     if not isinstance(coverage, Mapping):
         return False
-    starting_fields = coverage.get("starting_fields", {})
+    starting_fields = coverage.get("required_fields", coverage.get("starting_fields", {}))
     if not isinstance(starting_fields, Mapping):
         return False
-    return all(bool(starting_fields.get(field)) for field in _STARTING_FIELDS)
+    return all(bool(starting_fields.get(field)) for field in REQUIRED_ONBOARDING_FIELDS)
+
+
+def required_field_prompt(field: str, *, attempt_count: int = 0) -> str:
+    prompts = {
+        "genre": "What genre should this story be? For example: sci-fi adventure, fantasy, mystery, horror.",
+        "tone": "What tone should it have? For example: mysterious, hopeful, grim, or humorous.",
+        "setting": "Where does it begin? For example: a space station, a derelict spaceship, an alien planet.",
+        "player_role": "Who is the player in this world? For example: scientist, explorer, pilot, investigator.",
+    }
+    reminder_prompts = {
+        "genre": "I still need the genre in a short phrase, like sci-fi adventure or mystery.",
+        "tone": "I still need the tone in a short phrase, like mysterious or hopeful.",
+        "setting": "I still need the starting setting in a short phrase, like space station or derelict spaceship.",
+        "player_role": "I still need the player role in a short phrase, like scientist or explorer.",
+    }
+    if attempt_count > 0:
+        return reminder_prompts.get(field, f"I still need the {field}.")
+    return prompts.get(field, f"What should the story's {field} be?")
+
+
+def required_field_from_setup(snapshot: Mapping[str, Any]) -> str | None:
+    current_setup = snapshot.get("normalized_setup", {})
+    if not isinstance(current_setup, Mapping):
+        return REQUIRED_ONBOARDING_FIELDS[0]
+    for field in REQUIRED_ONBOARDING_FIELDS:
+        if not _text(current_setup.get(field)):
+            return field
+    return None
+
+
+def is_refusal_like(text: str) -> bool:
+    normalized = text.strip().lower()
+    phrases = (
+        "you decide",
+        "make it yourself",
+        "surprise me",
+        "up to you",
+        "whatever",
+        "don't know",
+        "dont know",
+        "idk",
+        "no idea",
+        "anything",
+    )
+    return any(phrase in normalized for phrase in phrases)
+
+
+def extract_explicit_required_updates(answer_text: str) -> dict[str, Any]:
+    text = answer_text.strip()
+    if not text:
+        return {}
+
+    lowered = text.lower()
+    updates: dict[str, Any] = {}
+
+    genre_patterns = [
+        (r"\b(sci[- ]?fi|science fiction|space opera|space adventure|cosmic adventure)\b", "sci-fi adventure"),
+        (r"\bfantasy\b", "fantasy"),
+        (r"\bmystery\b", "mystery"),
+        (r"\bhorror\b", "horror"),
+        (r"\bthriller\b", "thriller"),
+        (r"\badventure\b", "adventure"),
+    ]
+    for pattern, value in genre_patterns:
+        if re.search(pattern, lowered):
+            updates["genre"] = value
+            break
+
+    tone_patterns = [
+        (r"\bmysteri\w*\b", "mysterious"),
+        (r"\bhopeful\b", "hopeful"),
+        (r"\bgrim\b", "grim"),
+        (r"\bhumor\w*\b|\bfunny\b", "humorous"),
+        (r"\btense\b", "tense"),
+        (r"\bdark\b", "dark"),
+        (r"\binspir\w*\b", "inspiring"),
+    ]
+    for pattern, value in tone_patterns:
+        if re.search(pattern, lowered):
+            updates["tone"] = value
+            break
+
+    setting_patterns = [
+        (r"\bderelict spaceship\b", "derelict spaceship"),
+        (r"\bspace station\b", "space station"),
+        (r"\borbital station\b", "orbital station"),
+        (r"\bfar future\b", "the far future"),
+        (r"\bend of the universe\b|\bedge of the universe\b", "the end of the universe"),
+        (r"\balien planet\b", "an alien planet"),
+        (r"\bdistant moon\b", "a distant moon"),
+        (r"\bmoon\b", "a moon"),
+        (r"\bplanet\b", "a planet"),
+        (r"\buniverse\b", "the universe"),
+        (r"\bspaceship\b", "a spaceship"),
+        (r"\bship\b", "a ship"),
+    ]
+    for pattern, value in setting_patterns:
+        if re.search(pattern, lowered):
+            updates["setting"] = value
+            break
+
+    roles: list[str] = []
+    if re.search(r"\bscientist\b", lowered):
+        roles.append("scientist")
+    if re.search(r"\bexplorer\b", lowered):
+        roles.append("explorer")
+    if re.search(r"\bpilot\b", lowered):
+        roles.append("pilot")
+    if re.search(r"\binvestigator\b|\bdetective\b", lowered):
+        roles.append("investigator")
+    if re.search(r"\bengineer\b", lowered):
+        roles.append("engineer")
+    if roles:
+        updates["player_role"] = " ".join(dict.fromkeys(roles))
+
+    return updates
 
 
 class OllamaOnboardingReasoner:
@@ -251,9 +382,21 @@ class OllamaOnboardingReasoner:
         self.system_prompt = system_prompt or build_onboarding_system_prompt()
 
     def decide(self, snapshot: Mapping[str, Any]) -> OnboardingDecision:
+        missing_field = required_field_from_setup(snapshot)
+        if missing_field is None:
+            return OnboardingDecision(
+                kind="complete",
+                content=_fallback_completion_message(snapshot, snapshot.get("normalized_setup", {})),
+                setup=dict(snapshot.get("normalized_setup", {})),
+            )
+
+        question = self.next_question(snapshot, missing_field=missing_field, attempt_count=_count_attempts(snapshot, missing_field))
+        return OnboardingDecision(kind="question", content=question)
+
+    def next_question(self, snapshot: Mapping[str, Any], *, missing_field: str, attempt_count: int = 0) -> str:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        prompt = build_onboarding_turn_prompt(snapshot)
+        prompt = build_onboarding_question_prompt(snapshot, missing_field=missing_field, attempt_count=attempt_count)
         response = self.model.invoke(
             [
                 SystemMessage(content=self.system_prompt),
@@ -261,36 +404,38 @@ class OllamaOnboardingReasoner:
             ],
         )
         content = response.content if isinstance(response.content, str) else str(response.content)
-        return self._parse_decision(content, snapshot)
+        payload = self._extract_payload(content)
+        if payload is not None:
+            text = _coerce_message_text(payload.get("content"), required_field_prompt(missing_field, attempt_count=attempt_count))
+            return text
+        return _coerce_message_text(content, required_field_prompt(missing_field, attempt_count=attempt_count))
 
-    def _parse_decision(self, content: str, snapshot: Mapping[str, Any]) -> OnboardingDecision:
+    def extract_updates(self, snapshot: Mapping[str, Any], *, answer_text: str, asked_field: str) -> dict[str, Any]:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        prompt = build_onboarding_extraction_prompt(snapshot, asked_field=asked_field, answer_text=answer_text)
+        response = self.model.invoke(
+            [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=prompt),
+            ],
+        )
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        updates = self._parse_updates(content, asked_field=asked_field, answer_text=answer_text)
+        if updates:
+            return updates
+        return extract_explicit_required_updates(answer_text)
+
+    def _parse_updates(self, content: str, *, asked_field: str, answer_text: str) -> dict[str, Any]:
         text = content.strip()
         payload = self._extract_payload(text)
         if payload is None:
-            return OnboardingDecision(
-                kind="question",
-                content=_coerce_message_text(text, _fallback_onboarding_question(snapshot)),
-            )
+            return {}
 
-        kind = str(payload.get("kind") or payload.get("type") or "question").lower()
-        if kind == "complete":
-            setup = payload.get("setup") or payload.get("normalized_setup") or {}
-            if not isinstance(setup, dict):
-                setup = {}
-            content_text = _coerce_message_text(
-                payload.get("content") or payload.get("summary") or payload.get("message"),
-                _fallback_completion_message(snapshot, setup),
-            )
-            return OnboardingDecision(kind="complete", content=content_text, setup=dict(setup))
-
-        content_text = _coerce_message_text(
-            payload.get("content") or payload.get("question") or payload.get("prompt"),
-            _fallback_onboarding_question(snapshot),
-        )
-        updates = payload.get("updates") or payload.get("setup") or payload.get("normalized_setup") or {}
-        if not isinstance(updates, dict):
-            updates = {}
-        return OnboardingDecision(kind="question", content=content_text, updates=dict(updates))
+        updates = payload.get("updates") or payload.get("setup") or payload.get("normalized_setup") or payload
+        if not isinstance(updates, Mapping):
+            return {}
+        return _normalize_required_updates(updates)
 
     def _extract_payload(self, text: str) -> dict[str, Any] | None:
         if not text:
@@ -313,6 +458,26 @@ class OllamaOnboardingReasoner:
         if not isinstance(payload, dict):
             return None
         return payload
+
+
+def _normalize_required_updates(updates: Mapping[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for field in REQUIRED_ONBOARDING_FIELDS:
+        value = _text(updates.get(field))
+        if value:
+            normalized[field] = value
+    return normalized
+
+
+def _count_attempts(snapshot: Mapping[str, Any], field: str) -> int:
+    answers = snapshot.get("recent_answers", [])
+    if not isinstance(answers, Sequence):
+        return 0
+    count = 0
+    for answer in answers:
+        if isinstance(answer, Mapping) and str(answer.get("question_key") or "") == field:
+            count += 1
+    return count
 
 
 def normalize_onboarding_setup(

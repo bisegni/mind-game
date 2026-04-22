@@ -718,7 +718,9 @@ class StoryStateStore:
         if current is None:
             raise KeyError(f"Unknown onboarding session: {onboarding_session_id}")
 
-        answers = {answer.question_key: answer.raw_answer_text for answer in current.answers}
+        answers: dict[str, Any] = {}
+        for answer in current.answers:
+            answers.update(dict(answer.normalized_answer))
         resolved_setup = normalize_onboarding_setup(answers, question_order=current.question_order)
         resolved_setup.update(dict(current.normalized_setup))
         if normalized_setup is not None:
