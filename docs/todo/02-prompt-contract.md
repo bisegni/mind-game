@@ -3,7 +3,9 @@
 ## Goal
 
 Define the prompt contract that keeps the agent, narrator, and memory system aligned while the game runs.
-This todo builds on the base engine and refines how the agent thinks and speaks.
+This todo builds on the base engine and refines how the agent thinks and speaks. Promtp need to be specified
+to ensure the model can manage the game loop, use memory effectively, and produce consistent story output without being overwhelmed by the full chat history. The contract should also allow for tool use while keeping the narrator's voice intact. The statis pormpt part need to ber store into MD fierls into
+
 
 ## Prompt Layers
 
