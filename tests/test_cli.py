@@ -116,7 +116,7 @@ class CliTests(unittest.TestCase):
             onboarding = reopened.load_session_onboarding(session.id)
 
             self.assertEqual(exit_code, 0)
-            story_store_cls.assert_called_once_with()
+            story_store_cls.assert_called_once_with(cli.default_story_db_path())
             self.assertIn("What kind of story do you want to play?", output)
             self.assertEqual(onboarding.status, "complete")
             self.assertEqual(session.status, "active")

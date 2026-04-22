@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
@@ -111,8 +112,12 @@ def build_onboarding_reasoner(model_name: str, base_url: str) -> OllamaOnboardin
 def build_story_store() -> StoryStateStore:
     db_path = os.environ.get("MIND_GAME_STORY_DB_PATH")
     if not db_path:
-        return StoryStateStore()
+        return StoryStateStore(default_story_db_path())
     return StoryStateStore(db_path)
+
+
+def default_story_db_path() -> Path:
+    return Path(__file__).resolve().parents[1] / ".mind_game.sqlite3"
 
 
 def main() -> int:
