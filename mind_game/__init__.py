@@ -1,0 +1,2 @@
+"""Mind Game prototype package."""
+

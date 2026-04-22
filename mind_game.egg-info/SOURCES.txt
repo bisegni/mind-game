@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+mind_game/__init__.py
+mind_game/cli.py
+mind_game/prompt.py
+mind_game.egg-info/PKG-INFO
+mind_game.egg-info/SOURCES.txt
+mind_game.egg-info/dependency_links.txt
+mind_game.egg-info/requires.txt
+mind_game.egg-info/top_level.txt
+tests/test_main.py
+tests/test_prompt.py

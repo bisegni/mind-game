@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: mind-game
+Version: 0.1.0
+Summary: A tiny Ollama-powered conversation loop for an evolving game prototype.
+Requires-Python: >=3.11
+Requires-Dist: langchain-core>=0.3.0
+Requires-Dist: langchain-ollama>=0.2.0
