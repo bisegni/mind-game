@@ -8,10 +8,19 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
-from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history
-from .onboarding import OnboardingQuestion, get_onboarding_question_order, get_onboarding_questions
+from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history, stream_message
+from .onboarding import (
+    OllamaOnboardingReasoner,
+    build_onboarding_prompt_state,
+    build_onboarding_seed_scene,
+    normalize_onboarding_setup,
+    should_complete_onboarding,
+)
 from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
 from .story_state import OnboardingSessionRecord, StoryStateStore
+
+
+MAX_ONBOARDING_EXCHANGES = 2
 
 
 @dataclass(slots=True)
@@ -84,10 +93,25 @@ def build_reasoner(model_name: str, base_url: str) -> OllamaReActReasoner:
     return OllamaReActReasoner(model=model, system_prompt=build_system_prompt())
 
 
-def build_story_store() -> StoryStateStore | None:
+def build_onboarding_reasoner(model_name: str, base_url: str) -> OllamaOnboardingReasoner:
+    try:
+        from langchain_ollama import ChatOllama
+    except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
+        raise ModuleNotFoundError(error.name) from error
+
+    model = ChatOllama(
+        model=model_name,
+        base_url=base_url,
+        temperature=0.7,
+        max_retries=2,
+    )
+    return OllamaOnboardingReasoner(model=model)
+
+
+def build_story_store() -> StoryStateStore:
     db_path = os.environ.get("MIND_GAME_STORY_DB_PATH")
     if not db_path:
-        return None
+        return StoryStateStore()
     return StoryStateStore(db_path)
 
 
@@ -97,6 +121,7 @@ def main() -> int:
 
     try:
         reasoner = build_reasoner(model_name, base_url)
+        onboarding_reasoner = build_onboarding_reasoner(model_name, base_url)
     except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
         print(f"Missing dependency: {error}. Install with `python -m pip install -e .`.")
         return 1
@@ -105,7 +130,7 @@ def main() -> int:
     try:
         story_session_id, onboarding_session = _resolve_story_session(story_store)
         if story_store is not None and onboarding_session is not None:
-            story_session_id = _run_onboarding_questionnaire(story_store, onboarding_session)
+            story_session_id = _run_onboarding_chat(story_store, onboarding_session, onboarding_reasoner)
 
         engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
 
@@ -114,9 +139,10 @@ def main() -> int:
 
         if story_store is not None and engine.story_session_id is not None:
             _print_session_history(story_store, engine.story_session_id)
+            _print_opening_scene(story_store, engine.story_session_id)
 
         while True:
-            user_text = input("You > ")
+            user_text = input("Player > ")
 
             if is_exit_command(user_text):
                 break
@@ -143,64 +169,189 @@ def _resolve_story_session(story_store: StoryStateStore | None) -> tuple[int | N
     if story_store is None:
         return None, None
 
-    onboarding_session = story_store.latest_incomplete_onboarding_session()
-    if onboarding_session is not None:
-        return onboarding_session.session_id, onboarding_session
-
-    orphan_onboarding_session = story_store.latest_session(status="onboarding")
-    if orphan_onboarding_session is not None:
-        onboarding_session = story_store.load_session_onboarding(orphan_onboarding_session.id)
-        if onboarding_session is None:
-            onboarding_session = story_store.create_onboarding_session(
-                orphan_onboarding_session.id,
-                question_order=get_onboarding_question_order(),
-                status="in_progress",
-            )
-        return orphan_onboarding_session.id, onboarding_session
+    onboarding_sessions = story_store.list_sessions(statuses=("onboarding",))
+    if onboarding_sessions:
+        return _choose_onboarding_session(story_store, onboarding_sessions)
 
     playable_session = story_store.latest_playable_session()
     if playable_session is not None:
         return playable_session.id, None
 
+    return _create_new_onboarding_session(story_store)
+
+
+def _choose_onboarding_session(
+    story_store: StoryStateStore,
+    onboarding_sessions: Sequence[Any],
+) -> tuple[int | None, OnboardingSessionRecord | None]:
+    print("Open onboarding sessions:")
+    for index, session in enumerate(onboarding_sessions, start=1):
+        created = session.created_at.replace("T", " ", 1)
+        updated = session.updated_at.replace("T", " ", 1)
+        print(
+            f"  {index}. session {session.id} | {session.status} | "
+            f"created {created} | updated {updated}",
+        )
+
+    while True:
+        choice = input("Choose a session number, press Enter for the newest, or 'n' for new onboarding: ").strip().lower()
+        if choice in {"", "r", "resume"}:
+            selected_session = onboarding_sessions[0]
+            break
+        if choice in {"n", "new"}:
+            return _create_new_onboarding_session(story_store)
+        if choice.isdigit():
+            selected_index = int(choice) - 1
+            if 0 <= selected_index < len(onboarding_sessions):
+                selected_session = onboarding_sessions[selected_index]
+                break
+        print("Please choose a listed session, press Enter, or type 'n'.")
+
+    onboarding_session = story_store.load_session_onboarding(selected_session.id)
+    if onboarding_session is None:
+        onboarding_session = story_store.create_onboarding_session(
+            selected_session.id,
+            status="in_progress",
+        )
+    return selected_session.id, onboarding_session
+
+
+def _create_new_onboarding_session(story_store: StoryStateStore) -> tuple[int | None, OnboardingSessionRecord]:
     session_id = story_store.create_session(status="onboarding")
     onboarding_session = story_store.create_onboarding_session(
         session_id,
-        question_order=get_onboarding_question_order(),
         status="in_progress",
     )
     return session_id, onboarding_session
 
 
-def _run_onboarding_questionnaire(
+def _run_onboarding_chat(
     story_store: StoryStateStore,
     onboarding_session: OnboardingSessionRecord,
+    onboarding_reasoner: OllamaOnboardingReasoner,
 ) -> int:
-    questions = {question.key: question for question in get_onboarding_questions()}
-    question_order = onboarding_session.question_order or get_onboarding_question_order()
-    answered_keys = {answer.question_key for answer in onboarding_session.answers}
-    total_questions = len(question_order)
+    current_session = onboarding_session
+    if current_session.answers:
+        stream_message(
+            ConsoleMessage(
+                role="narrator",
+                content="Resuming the story setup.",
+                turn_number=len(current_session.answers),
+                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+    else:
+        stream_message(
+            ConsoleMessage(
+                role="narrator",
+                content="Let's build your story together.",
+                turn_number=0,
+                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
 
-    for index, question_key in enumerate(question_order):
-        if question_key in answered_keys:
+    while True:
+        snapshot = build_onboarding_prompt_state(current_session)
+        decision = onboarding_reasoner.decide(snapshot)
+
+        if decision.kind == "question" and should_complete_onboarding(snapshot):
+            merged_setup = dict(current_session.normalized_setup)
+            merged_setup.update(decision.updates)
+            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
+            seed_scene = build_onboarding_seed_scene(
+                normalized_setup,
+                session_id=current_session.session_id,
+                onboarding_id=current_session.id,
+            )
+            completed = story_store.complete_onboarding_session(
+                current_session.id,
+                normalized_setup=normalized_setup,
+                generated_summary_text=_fallback_onboarding_completion_text(normalized_setup),
+                seed_scene=seed_scene,
+            )
+            return completed.session_id
+
+        if decision.kind == "complete":
+            merged_setup = dict(current_session.normalized_setup)
+            merged_setup.update(decision.setup)
+            normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
+            seed_scene = build_onboarding_seed_scene(
+                normalized_setup,
+                session_id=current_session.session_id,
+                onboarding_id=current_session.id,
+            )
+            completed = story_store.complete_onboarding_session(
+                current_session.id,
+                normalized_setup=normalized_setup,
+                generated_summary_text=decision.content,
+                seed_scene=seed_scene,
+            )
+            return completed.session_id
+
+        question_text = decision.content.strip() or "What should we define next?"
+        stream_message(
+            ConsoleMessage(
+                role="narrator",
+                content=question_text,
+                turn_number=len(current_session.answers),
+                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+        answer = input("Player > ").strip()
+        if not answer:
+            print("Please say a little more so I can shape the opening.")
             continue
 
-        question = questions.get(question_key) or OnboardingQuestion(
-            key=question_key,
-            prompt=f"What should we know about {question_key}?",
-        )
-        print(f"[{index + 1}/{total_questions}] {question.prompt}")
-        answer = input("> ").strip()
+        answer_index = len(current_session.answers)
+        normalized_answer = {
+            "assistant_question": question_text,
+            "user_answer": answer,
+            "updates": dict(decision.updates),
+        }
         story_store.record_onboarding_answer(
-            onboarding_session.id,
-            question_key=question.key,
-            question_text=question.prompt,
-            answer_index=index,
+            current_session.id,
+            question_key=f"exchange_{answer_index + 1}",
+            question_text=question_text,
+            answer_index=answer_index,
             raw_answer_text=answer,
-            normalized_answer={question.key: answer} if answer else {},
+            normalized_answer=normalized_answer,
         )
 
-    completed = story_store.complete_onboarding_session(onboarding_session.id)
-    return completed.session_id
+        merged_setup = dict(current_session.normalized_setup)
+        merged_setup.update(decision.updates)
+        normalized_setup = normalize_onboarding_setup(merged_setup, question_order=current_session.question_order)
+        current_session = story_store.update_onboarding_session(
+            current_session.id,
+            status="in_progress",
+            normalized_setup=normalized_setup,
+        )
+
+        if len(current_session.answers) >= MAX_ONBOARDING_EXCHANGES:
+            completed = story_store.complete_onboarding_session(
+                current_session.id,
+                normalized_setup=normalized_setup,
+                generated_summary_text=_fallback_onboarding_completion_text(normalized_setup),
+                seed_scene=build_onboarding_seed_scene(
+                    normalized_setup,
+                    session_id=current_session.session_id,
+                    onboarding_id=current_session.id,
+                ),
+            )
+            return completed.session_id
+
+
+def _fallback_onboarding_completion_text(normalized_setup: Mapping[str, Any]) -> str:
+    parts = ["Great, I have enough to start."]
+    genre = str(normalized_setup.get("genre") or "").strip()
+    tone = str(normalized_setup.get("tone") or "").strip()
+    setting = str(normalized_setup.get("setting") or "").strip()
+    if genre:
+        parts.append(f"This will be a {genre} story.")
+    if tone:
+        parts.append(f"It should feel {tone}.")
+    if setting:
+        parts.append(f"It begins in {setting}.")
+    return " ".join(parts)
 
 
 def _print_session_history(story_store: StoryStateStore, session_id: int) -> None:
@@ -224,8 +375,40 @@ def _print_turn_messages(story_store: StoryStateStore, session_id: int, player_i
         ]
 
     if messages:
-        print(render_message_batch(messages, use_color=use_color))
-        print()
+        player_message = next((message for message in messages if message.role == "player"), None)
+        narrator_message = next((message for message in messages if message.role == "narrator"), None)
+        if player_message is not None:
+            print(render_message_batch([player_message], use_color=use_color))
+        if narrator_message is not None:
+            stream_message(narrator_message, use_color=use_color)
+            print()
+
+
+def _print_opening_scene(story_store: StoryStateStore, session_id: int) -> None:
+    session = story_store.load_session(session_id)
+    onboarding = story_store.load_session_onboarding(session_id)
+    if session is None or onboarding is None or session.current_turn != 0:
+        return
+
+    opening_text = str(
+        onboarding.seed_scene.get("opening_prompt")
+        or onboarding.seed_scene.get("summary_text")
+        or onboarding.generated_summary_text
+        or "",
+    ).strip()
+    if not opening_text:
+        return
+
+    stream_message(
+        ConsoleMessage(
+            role="narrator",
+            content=opening_text,
+            turn_number=0,
+            created_at=session.created_at,
+            scene_id=session.current_scene_id,
+        ),
+    )
+    print()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import unittest
 
 from mind_game.console import (
@@ -7,6 +8,7 @@ from mind_game.console import (
     load_session_messages,
     render_message,
     render_session_history,
+    stream_message,
 )
 from mind_game.story_state import StoryStateStore
 
@@ -121,6 +123,30 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("Player", player_message)
         self.assertIn("hello", player_message)
         self.assertNotIn("\x1b[", player_message)
+
+    def test_stream_message_emits_narrator_content_in_chunks(self) -> None:
+        message = ConsoleMessage(
+            role="narrator",
+            content="The harbor lights shimmer in the fog.",
+            turn_number=4,
+            created_at="2026-04-22T10:00:00+00:00",
+            scene_id="scene:harbor",
+        )
+        writer = io.StringIO()
+        delays: list[float] = []
+
+        rendered = stream_message(
+            message,
+            use_color=False,
+            writer=writer,
+            chunk_delay=0.01,
+            sleep=delays.append,
+        )
+
+        self.assertEqual(rendered, render_message(message, use_color=False))
+        self.assertEqual(writer.getvalue(), rendered + "\n")
+        self.assertGreater(len(delays), 1)
+        self.assertTrue(all(delay == 0.01 for delay in delays))
 
 
 if __name__ == "__main__":

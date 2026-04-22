@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence, TextIO
 
 from .story_state import StorySessionRecord, StorySnapshotRecord, StoryStateStore, StoryTurnRecord
 
@@ -103,6 +105,45 @@ def render_message(
     return _render_message(message, use_color=use_color, theme=theme)
 
 
+def stream_message(
+    message: ConsoleMessage,
+    *,
+    use_color: bool = True,
+    theme: ConsoleTheme = DEFAULT_THEME,
+    writer: TextIO | None = None,
+    chunk_delay: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    rendered = _render_message(message, use_color=use_color, theme=theme)
+    target = writer or sys.stdout
+    if message.role != "narrator":
+        target.write(rendered + "\n")
+        target.flush()
+        return rendered
+
+    chunk_delay = _resolve_chunk_delay(chunk_delay, target)
+    lines = rendered.split("\n", 1)
+    if len(lines) != 2:
+        target.write(rendered + "\n")
+        target.flush()
+        return rendered
+
+    meta_line, content_line = lines
+    prefix, separator, content = content_line.partition(" | ")
+    if not separator:
+        target.write(rendered + "\n")
+        target.flush()
+        return rendered
+
+    target.write(meta_line + "\n")
+    target.write(prefix + " | ")
+    target.flush()
+    _write_streamed_text(target, content, chunk_delay=chunk_delay, sleep=sleep)
+    target.write("\n")
+    target.flush()
+    return rendered
+
+
 def render_message_batch(
     messages: Sequence[ConsoleMessage],
     *,
@@ -164,6 +205,47 @@ def _render_message(
         return f"{meta}\n{prefix} | {content}"
 
     return f"{meta}\n{prefix} | {message.content}"
+
+
+def _resolve_chunk_delay(chunk_delay: float | None, writer: TextIO) -> float:
+    if chunk_delay is not None:
+        return max(0.0, chunk_delay)
+    if hasattr(writer, "isatty") and writer.isatty():
+        return 0.01
+    return 0.0
+
+
+def _write_streamed_text(
+    writer: TextIO,
+    text: str,
+    *,
+    chunk_delay: float,
+    sleep: Callable[[float], None],
+) -> None:
+    if chunk_delay <= 0:
+        writer.write(text)
+        writer.flush()
+        return
+
+    for chunk in _chunk_text(text):
+        writer.write(chunk)
+        writer.flush()
+        sleep(chunk_delay)
+
+
+def _chunk_text(text: str) -> list[str]:
+    if not text:
+        return [""]
+    chunks: list[str] = []
+    token = []
+    for char in text:
+        token.append(char)
+        if char.isspace():
+            chunks.append("".join(token))
+            token = []
+    if token:
+        chunks.append("".join(token))
+    return chunks
 
 
 def _format_timestamp(value: str) -> str:

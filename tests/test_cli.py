@@ -9,7 +9,7 @@ from types import ModuleType
 from unittest.mock import patch
 
 from mind_game.engine import ReActDecision
-from mind_game.onboarding import OnboardingQuestion
+from mind_game.onboarding import OnboardingDecision
 from mind_game.story_state import StoryStateStore
 
 import mind_game.cli as cli
@@ -20,14 +20,71 @@ class FakeReasoner:
         return ReActDecision(kind="final", content=f"echo:{snapshot['player_input']}")
 
 
+class FakeOnboardingReasoner:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def decide(self, snapshot):
+        self.calls.append(snapshot)
+        if len(snapshot.get("recent_answers", [])) == 0:
+            return OnboardingDecision(
+                kind="question",
+                content="What kind of story do you want to play?",
+                updates={"genre": "mystery"},
+            )
+
+        return OnboardingDecision(
+            kind="complete",
+            content="We have enough to begin.",
+            setup={
+                "genre": "mystery",
+                "tone": "tense",
+                "setting": "foggy harbor",
+                "player_role": "a stubborn investigator",
+                "campaign_goal": "find the missing ship",
+                "difficulty": "moderate",
+                "opening_hook": "A fog-choked harbor hides a missing ship and a secret.",
+            },
+        )
+
+
+class CoreTriadOnboardingReasoner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def decide(self, snapshot):
+        self.calls += 1
+        if self.calls == 1:
+            return OnboardingDecision(
+                kind="question",
+                content="What genre would you like for your story?",
+                updates={"genre": "sci-fi"},
+            )
+        if self.calls == 2:
+            return OnboardingDecision(
+                kind="question",
+                content="What tone should it have?",
+                updates={"tone": "mysterious"},
+            )
+        if self.calls == 3:
+            return OnboardingDecision(
+                kind="question",
+                content="Where does it begin?",
+                updates={"setting": "a space station at the edge of the universe"},
+            )
+        return OnboardingDecision(kind="question", content="What happens next?", updates={})
+
+
 class CliTests(unittest.TestCase):
     def test_main_uses_package_cli_and_engine_loop(self) -> None:
         with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
             with patch.object(cli, "build_reasoner", return_value=FakeReasoner()) as build_reasoner:
-                with patch("builtins.input", side_effect=["hello", "exit"]):
-                    stdout = io.StringIO()
-                    with redirect_stdout(stdout):
-                        exit_code = cli.main()
+                with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                    with patch.object(cli, "build_story_store", return_value=None):
+                        with patch("builtins.input", side_effect=["hello", "exit"]):
+                            stdout = io.StringIO()
+                            with redirect_stdout(stdout):
+                                exit_code = cli.main()
 
         output = stdout.getvalue()
 
@@ -38,6 +95,33 @@ class CliTests(unittest.TestCase):
         self.assertIn("Narrator", output)
         self.assertIn("| echo:hello", output)
         build_reasoner.assert_called_once_with("test-model", "http://example.local:11434")
+
+    def test_main_uses_default_story_store_when_no_db_path_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "story.sqlite3"
+            store = StoryStateStore(path)
+
+            with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
+                with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                        with patch.object(cli, "StoryStateStore", return_value=store) as story_store_cls:
+                            with patch("builtins.input", side_effect=["mystery", "hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
+
+            output = stdout.getvalue()
+            reopened = StoryStateStore(path)
+            session = reopened.latest_playable_session()
+            onboarding = reopened.load_session_onboarding(session.id)
+
+            self.assertEqual(exit_code, 0)
+            story_store_cls.assert_called_once_with()
+            self.assertIn("What kind of story do you want to play?", output)
+            self.assertEqual(onboarding.status, "complete")
+            self.assertEqual(session.status, "active")
+            self.assertEqual([answer.question_key for answer in onboarding.answers], ["exchange_1"])
+            self.assertEqual(session.current_scene_id, onboarding.seed_scene["scene_id"])
 
     def test_main_passes_configured_story_store_to_the_engine(self) -> None:
         class FakeEngine:
@@ -57,6 +141,9 @@ class CliTests(unittest.TestCase):
 
             def latest_incomplete_onboarding_session(self):
                 return None
+
+            def list_sessions(self, *, statuses=None, limit=None):
+                return []
 
             def latest_session(self, *, status=None):
                 return None
@@ -82,12 +169,13 @@ class CliTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"MIND_GAME_STORY_DB_PATH": "/tmp/story.sqlite3"}, clear=True):
             with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
-                with patch.object(cli, "build_story_store", return_value=story_store) as build_story_store:
-                    with patch.object(cli, "BaseReActEngine", side_effect=FakeEngine) as engine_cls:
-                        with patch("builtins.input", side_effect=["hello", "exit"]):
-                            stdout = io.StringIO()
-                            with redirect_stdout(stdout):
-                                exit_code = cli.main()
+                with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                    with patch.object(cli, "build_story_store", return_value=story_store) as build_story_store:
+                        with patch.object(cli, "BaseReActEngine", side_effect=FakeEngine) as engine_cls:
+                            with patch("builtins.input", side_effect=["hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
 
         self.assertEqual(exit_code, 0)
         build_story_store.assert_called_once_with()
@@ -104,20 +192,14 @@ class CliTests(unittest.TestCase):
             path = Path(tmpdir) / "story.sqlite3"
             store = StoryStateStore(path)
 
-            questions = [
-                OnboardingQuestion(key="genre", prompt="What kind of story should this be?"),
-                OnboardingQuestion(key="tone", prompt="What tone should it have?"),
-            ]
-
             with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
                 with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
-                    with patch.object(cli, "build_story_store", return_value=store):
-                        with patch.object(cli, "get_onboarding_questions", return_value=questions):
-                            with patch.object(cli, "get_onboarding_question_order", return_value=[question.key for question in questions]):
-                                with patch("builtins.input", side_effect=["mystery", "tense", "hello", "exit"]):
-                                    stdout = io.StringIO()
-                                    with redirect_stdout(stdout):
-                                        exit_code = cli.main()
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                        with patch.object(cli, "build_story_store", return_value=store):
+                            with patch("builtins.input", side_effect=["", "mystery", "hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
 
             output = stdout.getvalue()
             reopened = StoryStateStore(path)
@@ -126,13 +208,13 @@ class CliTests(unittest.TestCase):
             turns = reopened.list_turns(session.id)
 
             self.assertEqual(exit_code, 0)
-            self.assertIn("What kind of story should this be?", output)
-            self.assertIn("What tone should it have?", output)
+            self.assertIn("What kind of story do you want to play?", output)
+            self.assertIn("A fog-choked harbor hides a missing ship and a secret.", output)
             self.assertIn("| hello", output)
             self.assertEqual(session.status, "active")
             self.assertEqual(session.current_scene_id, onboarding.seed_scene["scene_id"])
             self.assertEqual(onboarding.status, "complete")
-            self.assertEqual([answer.question_key for answer in onboarding.answers], ["genre", "tone"])
+            self.assertEqual([answer.question_key for answer in onboarding.answers], ["exchange_1"])
             self.assertEqual([turn.player_input for turn in turns], ["hello"])
             self.assertEqual(session.current_turn, 1)
 
@@ -142,20 +224,14 @@ class CliTests(unittest.TestCase):
             store = StoryStateStore(path)
             session_id = store.create_session(status="onboarding")
 
-            questions = [
-                OnboardingQuestion(key="genre", prompt="What kind of story should this be?"),
-                OnboardingQuestion(key="tone", prompt="What tone should it have?"),
-            ]
-
             with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
                 with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
-                    with patch.object(cli, "build_story_store", return_value=store):
-                        with patch.object(cli, "get_onboarding_questions", return_value=questions):
-                            with patch.object(cli, "get_onboarding_question_order", return_value=[question.key for question in questions]):
-                                with patch("builtins.input", side_effect=["mystery", "tense", "hello", "exit"]):
-                                    stdout = io.StringIO()
-                                    with redirect_stdout(stdout):
-                                        exit_code = cli.main()
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                        with patch.object(cli, "build_story_store", return_value=store):
+                            with patch("builtins.input", side_effect=["", "mystery", "hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
 
             output = stdout.getvalue()
             reopened = StoryStateStore(path)
@@ -164,8 +240,7 @@ class CliTests(unittest.TestCase):
             session_count = reopened.connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
             self.assertEqual(exit_code, 0)
-            self.assertIn("What kind of story should this be?", output)
-            self.assertIn("What tone should it have?", output)
+            self.assertIn("What kind of story do you want to play?", output)
             self.assertIn("| hello", output)
             self.assertEqual(session_count, 1)
             self.assertIsNotNone(onboarding)
@@ -174,7 +249,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(session.id, session_id)
             self.assertEqual(session.onboarding_id, str(onboarding.id))
             self.assertEqual(session.current_scene_id, onboarding.seed_scene["scene_id"])
-            self.assertEqual([answer.question_key for answer in onboarding.answers], ["genre", "tone"])
+            self.assertEqual([answer.question_key for answer in onboarding.answers], ["exchange_1"])
             self.assertEqual([turn.player_input for turn in reopened.list_turns(session_id)], ["hello"])
 
     def test_main_resumes_onboarding_from_next_unanswered_question(self) -> None:
@@ -182,34 +257,23 @@ class CliTests(unittest.TestCase):
             path = Path(tmpdir) / "story.sqlite3"
             store = StoryStateStore(path)
             session_id = store.create_session(status="onboarding")
-
-            questions = [
-                OnboardingQuestion(key="genre", prompt="What kind of story should this be?"),
-                OnboardingQuestion(key="tone", prompt="What tone should it have?"),
-            ]
             onboarding = store.create_onboarding_session(
                 session_id,
-                question_order=[question.key for question in questions],
                 status="in_progress",
             )
-            store.record_onboarding_answer(
+            store.update_onboarding_session(
                 onboarding.id,
-                question_key="genre",
-                question_text=questions[0].prompt,
-                answer_index=0,
-                raw_answer_text="mystery",
-                normalized_answer={"genre": "mystery"},
+                normalized_setup={"genre": "mystery"},
             )
 
             with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
                 with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
-                    with patch.object(cli, "build_story_store", return_value=store):
-                        with patch.object(cli, "get_onboarding_questions", return_value=questions):
-                            with patch.object(cli, "get_onboarding_question_order", return_value=[question.key for question in questions]):
-                                with patch("builtins.input", side_effect=["tense", "hello", "exit"]):
-                                    stdout = io.StringIO()
-                                    with redirect_stdout(stdout):
-                                        exit_code = cli.main()
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                        with patch.object(cli, "build_story_store", return_value=store):
+                            with patch("builtins.input", side_effect=["", "mystery", "hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
 
             output = stdout.getvalue()
             reopened = StoryStateStore(path)
@@ -217,12 +281,40 @@ class CliTests(unittest.TestCase):
             session = reopened.load_session(session_id)
 
             self.assertEqual(exit_code, 0)
-            self.assertNotIn("What kind of story should this be?", output)
-            self.assertIn("What tone should it have?", output)
-            self.assertEqual([answer.question_key for answer in completed.answers], ["genre", "tone"])
+            self.assertIn("What kind of story do you want to play?", output)
+            self.assertEqual([answer.question_key for answer in completed.answers], ["exchange_1"])
             self.assertEqual(completed.status, "complete")
             self.assertEqual(session.status, "active")
             self.assertEqual(session.current_turn, 1)
+
+    def test_onboarding_auto_completes_after_core_story_fields_are_known(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "story.sqlite3"
+            store = StoryStateStore(path)
+
+            with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
+                with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=CoreTriadOnboardingReasoner()):
+                        with patch.object(cli, "build_story_store", return_value=store):
+                            with patch("builtins.input", side_effect=["mystery", "mysterious", "hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
+
+            output = stdout.getvalue()
+            reopened = StoryStateStore(path)
+            session = reopened.latest_playable_session()
+            onboarding = reopened.load_session_onboarding(session.id)
+            turns = reopened.list_turns(session.id)
+
+            self.assertEqual(exit_code, 0)
+            self.assertNotIn("goal", output.lower())
+            self.assertNotIn("opening hook", output.lower())
+            self.assertEqual(onboarding.status, "complete")
+            self.assertEqual(session.status, "active")
+            self.assertEqual([answer.question_key for answer in onboarding.answers], ["exchange_1", "exchange_2"])
+            self.assertEqual([turn.player_input for turn in turns], ["hello"])
+            self.assertIn("universe", onboarding.seed_scene["summary_text"].lower())
 
     def test_reasoner_decide_uses_the_layered_turn_prompt_path(self) -> None:
         class PromptRecordingModel:
@@ -278,6 +370,63 @@ class CliTests(unittest.TestCase):
         self.assertIn("bounded ReAct turn for the Mind Game prototype", model.calls[0][1].content)
         self.assertIn("TURN PROMPT SENTINEL", model.calls[0][1].content)
 
+    def test_onboarding_reasoner_returns_plain_text_when_model_emits_structured_content(self) -> None:
+        class PromptRecordingModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def invoke(self, messages):
+                self.calls.append(messages)
+                return SimpleNamespace(
+                    content='{"kind":"question","content":{"genre":null,"story_promises":["A thought-provoking narrative experience."]},"updates":{"genre":"sci-fi"}}',
+                )
+
+        model = PromptRecordingModel()
+        reasoner = cli.OllamaOnboardingReasoner(model=model, system_prompt="system prompt")
+        snapshot = {
+            "normalized_setup": {},
+            "recent_answers": [],
+            "answer_count": 0,
+            "coverage": {
+                "starting_fields": {
+                    "genre": False,
+                    "tone": False,
+                    "setting": True,
+                },
+            },
+            "generated_summary_text": "",
+            "seed_scene": {},
+        }
+
+        messages_module = ModuleType("langchain_core.messages")
+
+        class FakeSystemMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeHumanMessage:
+            def __init__(self, content):
+                self.content = content
+
+        messages_module.SystemMessage = FakeSystemMessage
+        messages_module.HumanMessage = FakeHumanMessage
+
+        langchain_core_module = ModuleType("langchain_core")
+        langchain_core_module.messages = messages_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "langchain_core": langchain_core_module,
+                "langchain_core.messages": messages_module,
+            },
+        ):
+            decision = reasoner.decide(snapshot)
+
+        self.assertEqual(decision.kind, "question")
+        self.assertNotIn("{", decision.content)
+        self.assertTrue(decision.content.lower().startswith("tell me a little more"))
+
     def test_main_renders_existing_session_history_before_accepting_new_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "story.sqlite3"
@@ -295,11 +444,12 @@ class CliTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
                 with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
-                    with patch.object(cli, "build_story_store", return_value=store):
-                        with patch("builtins.input", side_effect=["hello", "exit"]):
-                            stdout = io.StringIO()
-                            with redirect_stdout(stdout):
-                                exit_code = cli.main()
+                    with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
+                        with patch.object(cli, "build_story_store", return_value=store):
+                            with patch("builtins.input", side_effect=["hello", "exit"]):
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    exit_code = cli.main()
 
             output = stdout.getvalue()
             reopened = StoryStateStore(path)

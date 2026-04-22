@@ -398,6 +398,42 @@ class StoryStateStore:
             onboarding_id=data["onboarding_id"],
         )
 
+    def list_sessions(
+        self,
+        *,
+        statuses: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[StorySessionRecord]:
+        sql = """
+            SELECT id, created_at, updated_at, status, seed_scene_id, current_turn,
+                   current_scene_id, current_summary_id, onboarding_id
+            FROM sessions
+        """
+        params: list[Any] = []
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        sql += " ORDER BY updated_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._connection.execute(sql, params).fetchall()
+        return [
+            StorySessionRecord(
+                id=int(row["id"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                status=str(row["status"]),
+                seed_scene_id=row["seed_scene_id"],
+                current_turn=int(row["current_turn"]),
+                current_scene_id=row["current_scene_id"],
+                current_summary_id=row["current_summary_id"],
+                onboarding_id=row["onboarding_id"],
+            )
+            for row in rows
+        ]
+
     def latest_playable_session(self) -> StorySessionRecord | None:
         row = self._connection.execute(
             """

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 
@@ -26,6 +27,14 @@ _NORMALIZED_KEYS = (
 class OnboardingQuestion:
     key: str
     prompt: str
+
+
+@dataclass(frozen=True, slots=True)
+class OnboardingDecision:
+    kind: str
+    content: str
+    updates: dict[str, Any] = field(default_factory=dict)
+    setup: dict[str, Any] = field(default_factory=dict)
 
 
 _QUESTIONNAIRE: tuple[OnboardingQuestion, ...] = (
@@ -54,6 +63,9 @@ _QUESTIONNAIRE: tuple[OnboardingQuestion, ...] = (
         prompt="How hard should the game feel?",
     ),
 )
+
+_STARTING_FIELDS = ("genre", "tone", "setting")
+_ADDITIONAL_FIELDS = ("player_role", "campaign_goal", "difficulty", "must_have_constraints", "must_avoid_constraints")
 
 
 def _text(value: Any) -> str | None:
@@ -97,12 +109,210 @@ def _slugify(value: str) -> str:
     return slug or "seed"
 
 
+def _looks_structured(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith("{") or stripped.startswith("[") or ("\n" in stripped and "}" in stripped)
+
+
+def _coerce_message_text(value: Any, fallback: str) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if text and not _looks_structured(text):
+            return text
+    return fallback
+
+
+def _fallback_onboarding_question(snapshot: Mapping[str, Any]) -> str:
+    coverage = snapshot.get("coverage", {})
+    starting_fields = coverage.get("starting_fields", {}) if isinstance(coverage, Mapping) else {}
+    labels = {
+        "genre": "genre",
+        "tone": "tone",
+        "setting": "setting",
+    }
+    missing: list[str] = []
+    if isinstance(starting_fields, Mapping):
+        for key, is_done in starting_fields.items():
+            if not is_done:
+                missing.append(labels.get(str(key), str(key)))
+
+    if not missing:
+        return "I have the core idea. I’m filling in the rest now."
+    if len(missing) == 1:
+        return f"Tell me a little more about the story's {missing[0]}."
+    if len(missing) == 2:
+        return f"Tell me a little more about the story's {missing[0]} and {missing[1]}."
+    return "Tell me a little more about the story's genre, tone, or starting setup."
+
+
+def _fallback_completion_message(snapshot: Mapping[str, Any], setup: Mapping[str, Any]) -> str:
+    seed_scene = build_onboarding_seed_scene(setup)
+    summary_text = str(seed_scene.get("summary_text") or "").strip()
+    if summary_text and not _looks_structured(summary_text):
+        return summary_text
+
+    genre = _text(setup.get("genre"))
+    setting = _text(setup.get("setting"))
+    player_role = _text(setup.get("player_role"))
+    if genre or setting or player_role:
+        bits = ["Great, I have enough to start"]
+        if genre:
+            bits.append(f"a {genre} story")
+        if setting:
+            bits.append(f"set in {setting}")
+        if player_role:
+            bits.append(f"with you as {player_role}")
+        return " ".join(bits) + "."
+
+    return "Great, I have enough to start."
+
+
 def get_onboarding_questions() -> list[OnboardingQuestion]:
     return list(_QUESTIONNAIRE)
 
 
 def get_onboarding_question_order() -> list[str]:
     return [question.key for question in _QUESTIONNAIRE]
+
+
+def build_onboarding_prompt_state(onboarding: Any) -> dict[str, Any]:
+    answers = [
+        {
+            "index": answer.answer_index,
+            "question": answer.question_text,
+            "answer": answer.raw_answer_text,
+            "normalized_answer": dict(answer.normalized_answer),
+            "created_at": answer.created_at,
+        }
+        for answer in getattr(onboarding, "answers", [])
+    ]
+    current_setup = dict(getattr(onboarding, "normalized_setup", {}))
+    coverage = {
+        "starting_fields": {field: bool(current_setup.get(field)) for field in _STARTING_FIELDS},
+        "additional_fields": {field: bool(current_setup.get(field)) for field in _ADDITIONAL_FIELDS},
+        "ready_to_start": all(current_setup.get(field) for field in _STARTING_FIELDS),
+    }
+    return {
+        "onboarding_id": getattr(onboarding, "id", None),
+        "session_id": getattr(onboarding, "session_id", None),
+        "status": getattr(onboarding, "status", None),
+        "answer_count": len(answers),
+        "normalized_setup": current_setup,
+        "recent_answers": answers[-6:],
+        "coverage": coverage,
+        "generated_summary_text": getattr(onboarding, "generated_summary_text", ""),
+        "seed_scene": dict(getattr(onboarding, "seed_scene", {})),
+    }
+
+
+def build_onboarding_system_prompt() -> str:
+    return " ".join(
+        [
+            "You are the onboarding guide for Mind Game.",
+            "Keep the conversation natural and ask at most one concise follow-up question at a time.",
+            "Do not use a rigid survey or a fixed question order.",
+            "Your goal is to gather only the core story triad: genre, tone, and starting situation.",
+            "Infer the player role, campaign goal, opening hook, and first event yourself once the core triad is clear.",
+            "Do not ask for the campaign goal, opening hook, or first event unless the user explicitly wants to define them.",
+            "Treat broad player directions, mood words, or requests like 'surprise me' as enough to finish.",
+            "When the core triad is present, stop asking questions and return a complete setup.",
+            "After at most two player replies, stop asking and complete the setup with what you have.",
+            "Return JSON only as either {\"kind\":\"question\",\"content\":\"...\",\"updates\":{...}} or {\"kind\":\"complete\",\"content\":\"...\",\"setup\":{...}}.",
+            "Keep the content short and friendly.",
+        ],
+    )
+
+
+def build_onboarding_turn_prompt(snapshot: Mapping[str, Any]) -> str:
+    payload = {
+        "current_setup": snapshot.get("normalized_setup", {}),
+        "coverage": snapshot.get("coverage", {}),
+        "recent_answers": snapshot.get("recent_answers", []),
+        "answer_count": snapshot.get("answer_count", 0),
+        "generated_summary_text": snapshot.get("generated_summary_text", ""),
+        "seed_scene": snapshot.get("seed_scene", {}),
+    }
+    return f"Onboarding state: {json.dumps(payload, sort_keys=True)}"
+
+
+def should_complete_onboarding(snapshot: Mapping[str, Any]) -> bool:
+    coverage = snapshot.get("coverage", {})
+    if not isinstance(coverage, Mapping):
+        return False
+    starting_fields = coverage.get("starting_fields", {})
+    if not isinstance(starting_fields, Mapping):
+        return False
+    return all(bool(starting_fields.get(field)) for field in _STARTING_FIELDS)
+
+
+class OllamaOnboardingReasoner:
+    def __init__(self, model: Any, *, system_prompt: str | None = None) -> None:
+        self.model = model
+        self.system_prompt = system_prompt or build_onboarding_system_prompt()
+
+    def decide(self, snapshot: Mapping[str, Any]) -> OnboardingDecision:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        prompt = build_onboarding_turn_prompt(snapshot)
+        response = self.model.invoke(
+            [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=prompt),
+            ],
+        )
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        return self._parse_decision(content, snapshot)
+
+    def _parse_decision(self, content: str, snapshot: Mapping[str, Any]) -> OnboardingDecision:
+        text = content.strip()
+        payload = self._extract_payload(text)
+        if payload is None:
+            return OnboardingDecision(
+                kind="question",
+                content=_coerce_message_text(text, _fallback_onboarding_question(snapshot)),
+            )
+
+        kind = str(payload.get("kind") or payload.get("type") or "question").lower()
+        if kind == "complete":
+            setup = payload.get("setup") or payload.get("normalized_setup") or {}
+            if not isinstance(setup, dict):
+                setup = {}
+            content_text = _coerce_message_text(
+                payload.get("content") or payload.get("summary") or payload.get("message"),
+                _fallback_completion_message(snapshot, setup),
+            )
+            return OnboardingDecision(kind="complete", content=content_text, setup=dict(setup))
+
+        content_text = _coerce_message_text(
+            payload.get("content") or payload.get("question") or payload.get("prompt"),
+            _fallback_onboarding_question(snapshot),
+        )
+        updates = payload.get("updates") or payload.get("setup") or payload.get("normalized_setup") or {}
+        if not isinstance(updates, dict):
+            updates = {}
+        return OnboardingDecision(kind="question", content=content_text, updates=dict(updates))
+
+    def _extract_payload(self, text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+
+        candidate = text.strip()
+        if not candidate:
+            return None
+
+        if not candidate.startswith("{"):
+            brace_index = candidate.find("{")
+            if brace_index == -1:
+                return None
+            candidate = candidate[brace_index:]
+
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
 
 
 def normalize_onboarding_setup(
@@ -176,7 +386,7 @@ def build_onboarding_seed_scene(
     tone = _text(normalized_setup.get("tone"))
     setting = _text(normalized_setup.get("setting"))
     player_role = _text(normalized_setup.get("player_role"))
-    campaign_goal = _text(normalized_setup.get("campaign_goal"))
+    campaign_goal = _text(normalized_setup.get("campaign_goal")) or _infer_campaign_goal(genre, tone, setting, player_role)
     opening_hook = _text(normalized_setup.get("opening_hook"))
     difficulty = _text(normalized_setup.get("difficulty"))
     world_tags = _listify(normalized_setup.get("world_tags"))
@@ -227,10 +437,49 @@ def build_onboarding_seed_scene(
         "world_tags": world_tags,
         "must_have_constraints": must_have_constraints,
         "must_avoid_constraints": must_avoid_constraints,
-        "story_promises": story_promises,
+        "story_promises": story_promises or _infer_story_promises(genre, tone, setting, player_role, campaign_goal),
         "starting_state": starting_state,
         "memory_seed": memory_seed,
         "session_id": session_id,
         "onboarding_id": onboarding_id,
         "normalized_setup": dict(normalized_setup),
     }
+
+
+def _infer_campaign_goal(
+    genre: str | None,
+    tone: str | None,
+    setting: str | None,
+    player_role: str | None,
+) -> str:
+    haystack = " ".join(part for part in [genre, tone, setting, player_role] if part).lower()
+    if any(word in haystack for word in ("space", "sci-fi", "science fiction", "universe", "station", "planet", "moon", "orbit")):
+        return "Uncover the truth behind the strange forces at the edge of the universe."
+    if any(word in haystack for word in ("mystery", "investigator", "detective", "secret", "hidden")):
+        return "Reveal the hidden truth and decide who can be trusted."
+    if any(word in haystack for word in ("horror", "haunted", "dark", "grim")):
+        return "Survive the threat and learn what is haunting this world."
+    return "Find out what is really happening and what the player should do next."
+
+
+def _infer_story_promises(
+    genre: str | None,
+    tone: str | None,
+    setting: str | None,
+    player_role: str | None,
+    campaign_goal: str | None,
+) -> list[str]:
+    promises: list[str] = []
+    if campaign_goal:
+        promises.append(campaign_goal)
+    if setting:
+        promises.append(f"Explore the mystery of {setting}.")
+    if genre:
+        promises.append(f"Deliver a {genre} adventure.")
+    if tone:
+        promises.append(f"Keep the tone {tone}.")
+    if player_role:
+        promises.append(f"Let the player act as {player_role}.")
+    if not promises:
+        promises.append("Explore a compelling story together.")
+    return promises[:4]
