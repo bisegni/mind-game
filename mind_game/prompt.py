@@ -40,6 +40,7 @@ def build_turn_prompt(snapshot: Mapping[str, Any], tools: Sequence[Any]) -> str:
         NARRATOR_VOICE_LAYER,
         COMPACT_MEMORY_LAYER,
         _format_snapshot(snapshot),
+        _format_story_graph(snapshot),
         _format_tool_catalog(tools),
         _format_tool_results(snapshot.get("observations", [])),
         TOOL_CONTEXT_LAYER,
@@ -52,11 +53,24 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
     compact_snapshot = {
         "turn": snapshot.get("turn", 0),
         "player_input": snapshot.get("player_input", ""),
+        "current_scene_id": snapshot.get("current_scene_id"),
+        "current_summary_id": snapshot.get("current_summary_id"),
+        "summary_text": snapshot.get("summary_text", ""),
         "facts": snapshot.get("facts", {}),
         "recent_messages": snapshot.get("recent_messages", []),
         "notes": snapshot.get("notes", []),
     }
     return f"Compact memory: {json.dumps(compact_snapshot, sort_keys=True)}"
+
+
+def _format_story_graph(snapshot: Mapping[str, Any]) -> str:
+    graph_bundle = {
+        "graph_focus": snapshot.get("graph_focus", {}),
+        "entities": snapshot.get("entities", []),
+        "edges": snapshot.get("edges", []),
+        "recent_turns": snapshot.get("recent_turns", []),
+    }
+    return f"Graph memory: {json.dumps(graph_bundle, sort_keys=True)}"
 
 
 def _format_tool_catalog(tools: Sequence[Any]) -> str:

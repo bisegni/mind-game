@@ -30,12 +30,25 @@ class PromptTests(unittest.TestCase):
         snapshot = {
             "turn": 7,
             "player_input": "look around",
+            "current_scene_id": "scene:harbor",
+            "current_summary_id": 42,
+            "summary_text": "A beacon cuts through the fog.",
             "facts": {"tone": "playful"},
             "recent_messages": [
                 {"role": "player", "content": "hello"},
                 {"role": "assistant", "content": "Welcome back."},
             ],
             "notes": ["keep the reply brief"],
+            "graph_focus": {"entity_ids": [11, 12]},
+            "entities": [
+                {"id": 11, "entity_type": "location", "canonical_key": "location:harbor", "name": "Harbor"},
+            ],
+            "edges": [
+                {"id": 22, "from_entity_id": 11, "to_entity_id": 12, "edge_type": "tracks", "weight": 1.0},
+            ],
+            "recent_turns": [
+                {"id": 1, "turn_number": 0, "player_input": "start", "narrator_output": "Fog rolls in."},
+            ],
             "observations": [
                 {"tool": "session.read", "result": '{"turn": 7}'},
             ],
@@ -50,9 +63,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn(GAME_LOOP_LAYER, prompt)
         self.assertIn(NARRATOR_VOICE_LAYER, prompt)
         self.assertIn(COMPACT_MEMORY_LAYER, prompt)
+        self.assertIn("current_scene_id", prompt)
+        self.assertIn("summary_text", prompt)
+        self.assertIn("Graph memory:", prompt)
+        self.assertIn('"entity_type": "location"', prompt)
+        self.assertIn('"edge_type": "tracks"', prompt)
+        self.assertIn('"turn_number": 0', prompt)
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
-        self.assertIn('Compact memory: {"facts": {"tone": "playful"}', prompt)
+        self.assertIn('"current_scene_id": "scene:harbor"', prompt)
+        self.assertIn('"summary_text": "A beacon cuts through the fog."', prompt)
+        self.assertIn('"facts": {"tone": "playful"}', prompt)
         self.assertIn('"recent_messages": [{"content": "hello", "role": "player"}', prompt)
         self.assertIn('Tool catalog: [{"description": "Return a compact session snapshot.", "name": "session.read"}', prompt)
         self.assertIn('Tool results: [{"result": "{\\"turn\\": 7}", "tool": "session.read"}]', prompt)

@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
+from .story_state import StoryStateStore
+
 
 Role = Literal["player", "assistant", "tool"]
 DecisionKind = Literal["tool", "final"]
@@ -84,16 +86,43 @@ class BaseReActEngine:
         self,
         reasoner: Reasoner,
         *,
+        story_store: StoryStateStore | None = None,
+        session_id: int | None = None,
         subagent_runner: SubagentRunner | None = None,
         tools: Sequence[Tool] | None = None,
         max_steps: int = 6,
     ) -> None:
         self._reasoner = reasoner
         self._subagent_runner = subagent_runner or DeterministicSubagentRunner()
-        self.session = GameSession()
+        self._story_store = story_store
+        self._story_session_id = session_id
         self._tools = list(tools or self._build_default_tools())
         self._tool_index = {tool.name: tool for tool in self._tools}
         self._max_steps = max_steps
+
+        if self._story_store is not None:
+            if self._story_session_id is None:
+                latest_session = self._story_store.latest_session()
+                self._story_session_id = (
+                    latest_session.id if latest_session is not None else self._story_store.create_session()
+                )
+
+            story_session = self._story_store.load_session(self._story_session_id)
+            if story_session is None:
+                raise KeyError(f"Unknown story session: {self._story_session_id}")
+
+            compact_state = self._story_store.build_prompt_state(
+                self._story_session_id,
+                player_input="",
+                observations=[],
+            )
+            self.session = GameSession(
+                turn=int(compact_state.get("turn", story_session.current_turn)),
+                facts=dict(compact_state.get("facts", {})),
+                notes=list(compact_state.get("notes", [])),
+            )
+        else:
+            self.session = GameSession()
 
     @property
     def tools(self) -> list[Tool]:
@@ -123,6 +152,18 @@ class BaseReActEngine:
             reply = decision.content.strip()
             self.session.transcript.append(GameMessage(role="assistant", content=reply))
             self.session.turn += 1
+            if self._story_store is not None and self._story_session_id is not None:
+                self._story_store.record_turn(
+                    self._story_session_id,
+                    turn_number=self.session.turn - 1,
+                    player_input=text,
+                    narrator_output=reply,
+                    prompt_state=snapshot,
+                    facts=dict(self.session.facts),
+                    notes=list(self.session.notes),
+                    observations=observations,
+                    consequences=[observation.result for observation in observations if observation.result],
+                )
             return EngineTurn(player_input=text, reply=reply, observations=observations)
 
         raise RuntimeError("ReAct loop exceeded the configured step limit")
@@ -152,6 +193,26 @@ class BaseReActEngine:
         ]
 
     def _snapshot(self, context: ToolContext, observations: Sequence[ToolObservation]) -> dict[str, Any]:
+        if self._story_store is not None and self._story_session_id is not None:
+            snapshot = self._story_store.build_prompt_state(
+                self._story_session_id,
+                player_input=context.player_input,
+                observations=observations,
+            )
+            snapshot["turn"] = self.session.turn
+            snapshot["facts"] = dict(self.session.facts)
+            snapshot["notes"] = list(self.session.notes[-6:])
+            snapshot["player_input"] = context.player_input
+            snapshot["observations"] = [
+                {"tool": item.tool, "result": item.result}
+                for item in observations
+            ]
+            snapshot["tool_catalog"] = [
+                {"name": tool.name, "description": tool.description}
+                for tool in self._tools
+            ]
+            return snapshot
+
         return {
             "turn": self.session.turn,
             "player_input": context.player_input,
@@ -179,11 +240,14 @@ class BaseReActEngine:
         return tool.handler(context, call.arguments)
 
     def _tool_session_read(self, context: ToolContext, arguments: Mapping[str, Any]) -> str:
+        payload = self._snapshot(context, [])
         payload = {
-            "turn": self.session.turn,
-            "facts": dict(self.session.facts),
-            "notes": list(self.session.notes[-3:]),
-            "player_input": context.player_input,
+            "turn": payload.get("turn", self.session.turn),
+            "facts": payload.get("facts", dict(self.session.facts)),
+            "notes": payload.get("notes", list(self.session.notes[-3:])),
+            "player_input": payload.get("player_input", context.player_input),
+            "summary_text": payload.get("summary_text", ""),
+            "graph_focus": payload.get("graph_focus", {}),
         }
         return json.dumps(payload, sort_keys=True)
 
@@ -227,4 +291,3 @@ class DeterministicSubagentRunner:
     def run(self, task: SubagentTask) -> str:
         preview = json.dumps(task.context, sort_keys=True)
         return f"{task.role} handled {task.task} with {preview[:120]}"
-

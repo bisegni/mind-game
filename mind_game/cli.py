@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
 from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
+from .story_state import StoryStateStore
 
 
 @dataclass(slots=True)
@@ -79,6 +80,13 @@ def build_reasoner(model_name: str, base_url: str) -> OllamaReActReasoner:
     return OllamaReActReasoner(model=model, system_prompt=build_system_prompt())
 
 
+def build_story_store() -> StoryStateStore | None:
+    db_path = os.environ.get("MIND_GAME_STORY_DB_PATH")
+    if not db_path:
+        return None
+    return StoryStateStore(db_path)
+
+
 def main() -> int:
     model_name = os.environ.get("OLLAMA_MODEL", "llama3.1")
     base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -89,12 +97,13 @@ def main() -> int:
         print(f"Missing dependency: {error}. Install with `python -m pip install -e .`.")
         return 1
 
-    engine = BaseReActEngine(reasoner)
-
-    print(f'Mind Game chat loop ready using Ollama model "{model_name}" at {base_url}.')
-    print('Type "exit" to quit.\n')
-
+    story_store = build_story_store()
     try:
+        engine = BaseReActEngine(reasoner, story_store=story_store)
+
+        print(f'Mind Game chat loop ready using Ollama model "{model_name}" at {base_url}.')
+        print('Type "exit" to quit.\n')
+
         while True:
             user_text = input("You > ")
 
@@ -112,6 +121,9 @@ def main() -> int:
     except Exception as error:  # pragma: no cover - defensive CLI guard
         print(f"Chat loop failed: {error}")
         return 1
+    finally:
+        if story_store is not None:
+            story_store.close()
 
     return 0
 

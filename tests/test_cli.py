@@ -30,6 +30,41 @@ class CliTests(unittest.TestCase):
         self.assertIn("AI  > echo:hello", output)
         build_reasoner.assert_called_once_with("test-model", "http://example.local:11434")
 
+    def test_main_passes_configured_story_store_to_the_engine(self) -> None:
+        class FakeEngine:
+            def __init__(self, reasoner, story_store=None):
+                self.reasoner = reasoner
+                self.story_store = story_store
+
+            def run_turn(self, player_input):
+                self.last_input = player_input
+                return SimpleNamespace(reply=f"echo:{player_input}")
+
+        class FakeStoryStore:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        story_store = FakeStoryStore()
+
+        with patch.dict("os.environ", {"MIND_GAME_STORY_DB_PATH": "/tmp/story.sqlite3"}, clear=True):
+            with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
+                with patch.object(cli, "build_story_store", return_value=story_store) as build_story_store:
+                    with patch.object(cli, "BaseReActEngine", side_effect=FakeEngine) as engine_cls:
+                        with patch("builtins.input", side_effect=["hello", "exit"]):
+                            stdout = io.StringIO()
+                            with redirect_stdout(stdout):
+                                exit_code = cli.main()
+
+        self.assertEqual(exit_code, 0)
+        build_story_store.assert_called_once_with()
+        engine_cls.assert_called_once()
+        self.assertIs(engine_cls.call_args.kwargs["story_store"], story_store)
+        self.assertIn("AI  > echo:hello", stdout.getvalue())
+        self.assertTrue(story_store.closed)
+
     def test_reasoner_decide_uses_the_layered_turn_prompt_path(self) -> None:
         class PromptRecordingModel:
             def __init__(self) -> None:

@@ -6,6 +6,7 @@ from mind_game.engine import (
     SubagentTask,
     ToolCall,
 )
+from mind_game.story_state import StoryEdgeDraft, StoryEntityDraft, StoryStateStore
 
 
 class ScriptedReasoner:
@@ -79,6 +80,112 @@ class EngineTests(unittest.TestCase):
         self.assertIn("session.write_fact", tool_names)
         self.assertIn("session.add_note", tool_names)
         self.assertIn("subagent.delegate", tool_names)
+
+    def test_run_turn_persists_compact_story_state_when_store_is_configured(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(seed_scene_id="scene:harbor", current_scene_id="scene:harbor")
+
+        harbor = store.upsert_entity(
+            session_id,
+            entity_type="location",
+            name="Harbor",
+            canonical_key="location:harbor",
+            properties={"mood": "foggy"},
+        )
+        light = store.upsert_entity(
+            session_id,
+            entity_type="item",
+            name="Beacon Light",
+            canonical_key="item:beacon-light",
+            properties={"lit": True},
+        )
+
+        seed_prompt_state = store.build_prompt_state(session_id, player_input="start", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="start",
+            narrator_output="The harbor disappears into fog.",
+            prompt_state=seed_prompt_state,
+            facts={"weather": "foggy"},
+            notes=["keep watch"],
+            entities=[
+                StoryEntityDraft(
+                    entity_type="location",
+                    name="Harbor",
+                    canonical_key=harbor.canonical_key,
+                    properties={"mood": "foggy"},
+                ),
+            ],
+            edges=[
+                StoryEdgeDraft(
+                    from_entity_key=harbor.canonical_key,
+                    to_entity_key=light.canonical_key,
+                    edge_type="tracks",
+                ),
+            ],
+            scene_id="scene:harbor",
+        )
+
+        reasoner = ScriptedReasoner(
+            [
+                ReActDecision(
+                    kind="tool",
+                    tool=ToolCall(
+                        name="session.write_fact",
+                        arguments={"key": "signal", "value": "open"},
+                    ),
+                ),
+                ReActDecision(kind="final", content="The fog parts around the beacon light."),
+            ],
+        )
+        engine = BaseReActEngine(reasoner, story_store=store, session_id=session_id)
+
+        turn = engine.run_turn("scan the harbor")
+
+        self.assertEqual(turn.reply, "The fog parts around the beacon light.")
+        self.assertEqual(engine.session.turn, 2)
+        self.assertEqual(engine.session.facts["weather"], "foggy")
+        self.assertEqual(engine.session.facts["signal"], "open")
+        self.assertEqual(len(reasoner.snapshots[0]["recent_turns"]), 1)
+        self.assertEqual(reasoner.snapshots[0]["summary_text"], "The harbor disappears into fog.")
+        self.assertTrue(reasoner.snapshots[0]["graph_focus"]["entity_ids"])
+
+        persisted_session = store.load_session(session_id)
+        persisted_snapshot = store.latest_snapshot(session_id)
+        persisted_turns = store.list_turns(session_id)
+        persisted_events = store.list_events(session_id)
+
+        self.assertEqual(persisted_session.current_turn, 2)
+        self.assertEqual(persisted_session.current_summary_id, persisted_snapshot.id)
+        self.assertEqual(len(persisted_turns), 2)
+        self.assertEqual(persisted_snapshot.summary_text, "The fog parts around the beacon light.")
+        self.assertEqual(persisted_snapshot.state["facts"]["signal"], "open")
+        self.assertTrue(any(event.event_type == "fact" for event in persisted_events))
+
+    def test_engine_uses_latest_stored_session_when_session_id_is_omitted(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:bridge")
+        prompt_state = store.build_prompt_state(session_id, player_input="start", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="start",
+            narrator_output="A lantern glows at the bridge.",
+            prompt_state=prompt_state,
+            scene_id="scene:bridge",
+        )
+
+        reasoner = ScriptedReasoner([ReActDecision(kind="final", content="resume ok")])
+        engine = BaseReActEngine(reasoner, story_store=store)
+
+        turn = engine.run_turn("continue")
+
+        self.assertEqual(turn.reply, "resume ok")
+        self.assertEqual(engine.session.turn, 2)
+        self.assertEqual(engine.session.notes, [])
+        self.assertEqual(reasoner.snapshots[0]["summary_text"], "A lantern glows at the bridge.")
+        self.assertEqual(reasoner.snapshots[0]["turn"], 1)
 
 
 if __name__ == "__main__":
