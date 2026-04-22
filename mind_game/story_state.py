@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
+from .onboarding import build_onboarding_seed_scene, normalize_onboarding_setup
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -133,6 +135,33 @@ class StoryEventDraft:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class OnboardingAnswerRecord:
+    id: int
+    onboarding_session_id: int
+    question_key: str
+    question_text: str
+    answer_index: int
+    raw_answer_text: str
+    normalized_answer: dict[str, Any]
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class OnboardingSessionRecord:
+    id: int
+    session_id: int
+    status: str
+    question_order: list[str]
+    answers: list[OnboardingAnswerRecord]
+    normalized_setup: dict[str, Any]
+    generated_summary_text: str
+    seed_scene: dict[str, Any]
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+
 class StoryStateStore:
     def __init__(
         self,
@@ -226,6 +255,32 @@ class StoryStateStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS onboarding_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                question_order_json TEXT NOT NULL DEFAULT '[]',
+                answers_json TEXT NOT NULL DEFAULT '[]',
+                normalized_setup_json TEXT NOT NULL DEFAULT '{}',
+                generated_summary_text TEXT NOT NULL DEFAULT '',
+                seed_scene_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS onboarding_answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                onboarding_session_id INTEGER NOT NULL REFERENCES onboarding_sessions(id) ON DELETE CASCADE,
+                question_key TEXT NOT NULL,
+                question_text TEXT NOT NULL,
+                answer_index INTEGER NOT NULL,
+                raw_answer_text TEXT NOT NULL,
+                normalized_answer_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(onboarding_session_id, question_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_session_turn
                 ON turns(session_id, turn_number);
             CREATE INDEX IF NOT EXISTS idx_entities_session_type_key
@@ -238,6 +293,10 @@ class StoryStateStore:
                 ON state_snapshots(session_id, turn_id);
             CREATE INDEX IF NOT EXISTS idx_events_session_turn
                 ON events(session_id, turn_id);
+            CREATE INDEX IF NOT EXISTS idx_onboarding_sessions_session_updated
+                ON onboarding_sessions(session_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_onboarding_answers_session_index
+                ON onboarding_answers(onboarding_session_id, answer_index);
             """
         )
         self._connection.commit()
@@ -312,12 +371,41 @@ class StoryStateStore:
             onboarding_id=data["onboarding_id"],
         )
 
-    def latest_session(self) -> StorySessionRecord | None:
+    def latest_session(self, *, status: str | None = None) -> StorySessionRecord | None:
+        sql = """
+            SELECT id, created_at, updated_at, status, seed_scene_id, current_turn,
+                   current_scene_id, current_summary_id, onboarding_id
+            FROM sessions
+        """
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
+        row = self._connection.execute(sql, params).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        return StorySessionRecord(
+            id=int(data["id"]),
+            created_at=str(data["created_at"]),
+            updated_at=str(data["updated_at"]),
+            status=str(data["status"]),
+            seed_scene_id=data["seed_scene_id"],
+            current_turn=int(data["current_turn"]),
+            current_scene_id=data["current_scene_id"],
+            current_summary_id=data["current_summary_id"],
+            onboarding_id=data["onboarding_id"],
+        )
+
+    def latest_playable_session(self) -> StorySessionRecord | None:
         row = self._connection.execute(
             """
             SELECT id, created_at, updated_at, status, seed_scene_id, current_turn,
                    current_scene_id, current_summary_id, onboarding_id
             FROM sessions
+            WHERE status = 'active'
+              AND (seed_scene_id IS NOT NULL OR current_scene_id IS NOT NULL)
             ORDER BY updated_at DESC, id DESC
             LIMIT 1
             """,
@@ -336,6 +424,319 @@ class StoryStateStore:
             current_summary_id=data["current_summary_id"],
             onboarding_id=data["onboarding_id"],
         )
+
+    def create_onboarding_session(
+        self,
+        session_id: int,
+        *,
+        question_order: Sequence[str] = (),
+        status: str = "in_progress",
+        normalized_setup: Mapping[str, Any] | None = None,
+        generated_summary_text: str = "",
+        seed_scene: Mapping[str, Any] | None = None,
+    ) -> OnboardingSessionRecord:
+        now = _now()
+        question_order_json = _json_dumps([str(question) for question in question_order])
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO onboarding_sessions (
+                    session_id,
+                    status,
+                    question_order_json,
+                    answers_json,
+                    normalized_setup_json,
+                    generated_summary_text,
+                    seed_scene_json,
+                    created_at,
+                    updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    session_id,
+                    status,
+                    question_order_json,
+                    _json_dumps([]),
+                    _json_dumps(dict(normalized_setup or {})),
+                    generated_summary_text,
+                    _json_dumps(dict(seed_scene or {})),
+                    now,
+                    now,
+                ),
+            )
+            onboarding_session_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                UPDATE sessions
+                SET status = ?, onboarding_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("onboarding", str(onboarding_session_id), now, session_id),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+        record = self.load_onboarding_session(onboarding_session_id)
+        if record is None:
+            raise RuntimeError("onboarding session insert failed")
+        return record
+
+    def load_onboarding_session(self, onboarding_session_id: int) -> OnboardingSessionRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT id, session_id, status, question_order_json, answers_json,
+                   normalized_setup_json, generated_summary_text, seed_scene_json,
+                   created_at, updated_at, completed_at
+            FROM onboarding_sessions
+            WHERE id = ?
+            """,
+            (onboarding_session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_onboarding_session_record(row)
+
+    def latest_onboarding_session(self, session_id: int) -> OnboardingSessionRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT id, session_id, status, question_order_json, answers_json,
+                   normalized_setup_json, generated_summary_text, seed_scene_json,
+                   created_at, updated_at, completed_at
+            FROM onboarding_sessions
+            WHERE session_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_onboarding_session_record(row)
+
+    def load_session_onboarding(self, session_id: int) -> OnboardingSessionRecord | None:
+        session = self.load_session(session_id)
+        if session is not None and session.onboarding_id and str(session.onboarding_id).isdigit():
+            onboarding = self.load_onboarding_session(int(session.onboarding_id))
+            if onboarding is not None:
+                return onboarding
+        return self.latest_onboarding_session(session_id)
+
+    def list_onboarding_answers(self, onboarding_session_id: int) -> list[OnboardingAnswerRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT id, onboarding_session_id, question_key, question_text,
+                   answer_index, raw_answer_text, normalized_answer_json, created_at
+            FROM onboarding_answers
+            WHERE onboarding_session_id = ?
+            ORDER BY answer_index ASC, id ASC
+            """,
+            (onboarding_session_id,),
+        ).fetchall()
+        return [self._row_to_onboarding_answer_record(row) for row in rows]
+
+    def record_onboarding_answer(
+        self,
+        onboarding_session_id: int,
+        *,
+        question_key: str,
+        question_text: str,
+        answer_index: int,
+        raw_answer_text: str,
+        normalized_answer: Mapping[str, Any] | None = None,
+    ) -> OnboardingAnswerRecord:
+        now = _now()
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO onboarding_answers (
+                    onboarding_session_id,
+                    question_key,
+                    question_text,
+                    answer_index,
+                    raw_answer_text,
+                    normalized_answer_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(onboarding_session_id, question_key) DO UPDATE SET
+                    question_text = excluded.question_text,
+                    answer_index = excluded.answer_index,
+                    raw_answer_text = excluded.raw_answer_text,
+                    normalized_answer_json = excluded.normalized_answer_json
+                """,
+                (
+                    onboarding_session_id,
+                    question_key,
+                    question_text,
+                    answer_index,
+                    raw_answer_text,
+                    _json_dumps(dict(normalized_answer or {})),
+                    now,
+                ),
+            )
+            record = self._connection.execute(
+                """
+                SELECT id, onboarding_session_id, question_key, question_text,
+                       answer_index, raw_answer_text, normalized_answer_json, created_at
+                FROM onboarding_answers
+                WHERE onboarding_session_id = ? AND question_key = ?
+                """,
+                (onboarding_session_id, question_key),
+            ).fetchone()
+            if record is None:
+                raise RuntimeError("onboarding answer insert failed")
+            session_row = self._connection.execute(
+                """
+                SELECT session_id
+                FROM onboarding_sessions
+                WHERE id = ?
+                """,
+                (onboarding_session_id,),
+            ).fetchone()
+            if session_row is None:
+                raise RuntimeError("onboarding session missing")
+            self._sync_onboarding_session_cache(
+                onboarding_session_id,
+                session_id=int(session_row["session_id"]),
+                updated_at=now,
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+        return self._row_to_onboarding_answer_record(record)
+
+    def update_onboarding_session(
+        self,
+        onboarding_session_id: int,
+        *,
+        status: str | None = None,
+        question_order: Sequence[str] | None = None,
+        normalized_setup: Mapping[str, Any] | None = None,
+        generated_summary_text: str | None = None,
+        seed_scene: Mapping[str, Any] | None = None,
+    ) -> OnboardingSessionRecord:
+        current = self.load_onboarding_session(onboarding_session_id)
+        if current is None:
+            raise KeyError(f"Unknown onboarding session: {onboarding_session_id}")
+
+        updates: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if question_order is not None:
+            updates.append("question_order_json = ?")
+            params.append(_json_dumps([str(question) for question in question_order]))
+        if normalized_setup is not None:
+            updates.append("normalized_setup_json = ?")
+            params.append(_json_dumps(dict(normalized_setup)))
+        if generated_summary_text is not None:
+            updates.append("generated_summary_text = ?")
+            params.append(generated_summary_text)
+        if seed_scene is not None:
+            updates.append("seed_scene_json = ?")
+            params.append(_json_dumps(dict(seed_scene)))
+
+        now = _now()
+        updates.append("updated_at = ?")
+        params.append(now)
+        params.append(onboarding_session_id)
+
+        try:
+            self._connection.execute(
+                f"""
+                UPDATE onboarding_sessions
+                SET {", ".join(updates)}
+                WHERE id = ?
+                """,
+                params,
+            )
+            self._connection.execute(
+                """
+                UPDATE sessions
+                SET status = ?, updated_at = ?, onboarding_id = ?
+                WHERE id = ?
+                """,
+                ("onboarding", now, str(onboarding_session_id), current.session_id),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+        return self.load_onboarding_session(onboarding_session_id) or current
+
+    def complete_onboarding_session(
+        self,
+        onboarding_session_id: int,
+        *,
+        normalized_setup: Mapping[str, Any] | None = None,
+        generated_summary_text: str | None = None,
+        seed_scene: Mapping[str, Any] | None = None,
+    ) -> OnboardingSessionRecord:
+        current = self.load_onboarding_session(onboarding_session_id)
+        if current is None:
+            raise KeyError(f"Unknown onboarding session: {onboarding_session_id}")
+
+        answers = {answer.question_key: answer.raw_answer_text for answer in current.answers}
+        resolved_setup = normalize_onboarding_setup(answers, question_order=current.question_order)
+        resolved_setup.update(dict(current.normalized_setup))
+        if normalized_setup is not None:
+            resolved_setup.update(dict(normalized_setup))
+
+        resolved_seed_scene = build_onboarding_seed_scene(
+            resolved_setup,
+            session_id=current.session_id,
+            onboarding_id=onboarding_session_id,
+        )
+        resolved_seed_scene.update(dict(current.seed_scene))
+        if seed_scene is not None:
+            resolved_seed_scene.update(dict(seed_scene))
+        resolved_summary = generated_summary_text or str(resolved_seed_scene.get("summary_text") or "")
+        now = _now()
+        try:
+            self._connection.execute(
+                """
+                UPDATE onboarding_sessions
+                SET status = ?, normalized_setup_json = ?, generated_summary_text = ?,
+                    seed_scene_json = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "complete",
+                    _json_dumps(resolved_setup),
+                    resolved_summary,
+                    _json_dumps(resolved_seed_scene),
+                    now,
+                    now,
+                    onboarding_session_id,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE sessions
+                SET status = ?, updated_at = ?, onboarding_id = ?, seed_scene_id = ?, current_scene_id = ?
+                WHERE id = ?
+                """,
+                (
+                    "active",
+                    now,
+                    str(onboarding_session_id),
+                    resolved_seed_scene.get("scene_id"),
+                    resolved_seed_scene.get("scene_id"),
+                    current.session_id,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+        return self.load_onboarding_session(onboarding_session_id) or current
 
     def list_turns(self, session_id: int, *, limit: int | None = None) -> list[StoryTurnRecord]:
         sql = """
@@ -536,6 +937,119 @@ class StoryStateStore:
             for row in rows
         ]
 
+    def _row_to_onboarding_answer_record(self, row: sqlite3.Row) -> OnboardingAnswerRecord:
+        return OnboardingAnswerRecord(
+            id=int(row["id"]),
+            onboarding_session_id=int(row["onboarding_session_id"]),
+            question_key=str(row["question_key"]),
+            question_text=str(row["question_text"]),
+            answer_index=int(row["answer_index"]),
+            raw_answer_text=str(row["raw_answer_text"]),
+            normalized_answer=_json_loads(row["normalized_answer_json"], {}),
+            created_at=str(row["created_at"]),
+        )
+
+    def _row_to_onboarding_session_record(self, row: sqlite3.Row) -> OnboardingSessionRecord:
+        onboarding_session_id = int(row["id"])
+        answers = self.list_onboarding_answers(onboarding_session_id)
+        return OnboardingSessionRecord(
+            id=onboarding_session_id,
+            session_id=int(row["session_id"]),
+            status=str(row["status"]),
+            question_order=_json_loads(row["question_order_json"], []),
+            answers=answers,
+            normalized_setup=_json_loads(row["normalized_setup_json"], {}),
+            generated_summary_text=str(row["generated_summary_text"]),
+            seed_scene=_json_loads(row["seed_scene_json"], {}),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            completed_at=row["completed_at"],
+        )
+
+    def _sync_onboarding_session_cache(
+        self,
+        onboarding_session_id: int,
+        *,
+        session_id: int,
+        updated_at: str,
+    ) -> None:
+        answers = self.list_onboarding_answers(onboarding_session_id)
+        answers_json = _json_dumps(
+            [
+                {
+                    "id": answer.id,
+                    "question_key": answer.question_key,
+                    "question_text": answer.question_text,
+                    "answer_index": answer.answer_index,
+                    "raw_answer_text": answer.raw_answer_text,
+                    "normalized_answer": answer.normalized_answer,
+                    "created_at": answer.created_at,
+                }
+                for answer in answers
+            ],
+        )
+        self._connection.execute(
+            """
+            UPDATE onboarding_sessions
+            SET answers_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (answers_json, updated_at, onboarding_session_id),
+        )
+        self._connection.execute(
+            """
+            UPDATE sessions
+            SET status = ?, updated_at = ?, onboarding_id = ?
+            WHERE id = ?
+            """,
+            ("onboarding", updated_at, str(onboarding_session_id), session_id),
+        )
+
+    def latest_incomplete_onboarding_session(self) -> OnboardingSessionRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT id, session_id, status, question_order_json, answers_json,
+                   normalized_setup_json, generated_summary_text, seed_scene_json,
+                   created_at, updated_at, completed_at
+            FROM onboarding_sessions
+            WHERE status IN ('pending', 'in_progress', 'reviewing')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_onboarding_session_record(row)
+
+    def _compact_onboarding_seed(self, onboarding: OnboardingSessionRecord) -> dict[str, Any]:
+        seed_scene = dict(onboarding.seed_scene)
+        if not seed_scene and onboarding.normalized_setup:
+            seed_scene = build_onboarding_seed_scene(
+                onboarding.normalized_setup,
+                session_id=onboarding.session_id,
+                onboarding_id=onboarding.id,
+            )
+
+        if not seed_scene:
+            return {}
+
+        return {
+            "onboarding_id": onboarding.id,
+            "session_id": onboarding.session_id,
+            "scene_id": seed_scene.get("scene_id"),
+            "summary_text": str(
+                onboarding.generated_summary_text
+                or seed_scene.get("summary_text")
+                or "",
+            ),
+            "facts": dict(seed_scene.get("facts", {})),
+            "world_tags": list(seed_scene.get("world_tags", [])),
+            "story_promises": list(seed_scene.get("story_promises", [])),
+            "starting_state": dict(seed_scene.get("starting_state", {})),
+            "memory_seed": dict(seed_scene.get("memory_seed", {})),
+            "normalized_setup": dict(onboarding.normalized_setup),
+        }
+
     def upsert_entity(
         self,
         session_id: int,
@@ -659,11 +1173,28 @@ class StoryStateStore:
         snapshot = self.latest_snapshot(session_id)
         snapshot_state = dict(snapshot.state) if snapshot is not None else {}
         graph_focus = dict(snapshot.graph_focus) if snapshot is not None else {}
+        onboarding = self.load_session_onboarding(session_id)
+        onboarding_seed = (
+            self._compact_onboarding_seed(onboarding)
+            if onboarding is not None and onboarding.status == "complete" and session.current_turn == 0
+            else {}
+        )
+        if snapshot is None and onboarding_seed:
+            snapshot_state = {
+                "summary_text": onboarding_seed.get("summary_text", ""),
+                "facts": dict(onboarding_seed.get("facts", {})),
+                "notes": list(onboarding_seed.get("story_promises", [])),
+                "recent_messages": [],
+                "observations": [],
+            }
         facts = dict(snapshot_state.get("facts", {}))
         notes = list(snapshot_state.get("notes", []))
+        summary_text = str(snapshot_state.get("summary_text", ""))
         current_scene_id = session.current_scene_id if session.current_scene_id is not None else None
         if current_scene_id is None and snapshot is not None:
             current_scene_id = snapshot.scene_id
+        if current_scene_id is None and onboarding_seed:
+            current_scene_id = str(onboarding_seed.get("scene_id") or "") or None
 
         recent_turns = self._load_recent_turns(session_id, recent_turn_limit)
         recent_messages = self._turns_to_messages(recent_turns)
@@ -679,7 +1210,7 @@ class StoryStateStore:
             "player_input": player_input,
             "current_scene_id": current_scene_id,
             "current_summary_id": session.current_summary_id,
-            "summary_text": snapshot.summary_text if snapshot is not None else "",
+            "summary_text": snapshot.summary_text if snapshot is not None else summary_text,
             "facts": facts,
             "notes": notes,
             "recent_messages": recent_messages,
@@ -688,6 +1219,7 @@ class StoryStateStore:
             "entities": [self._entity_to_dict(entity) for entity in entities],
             "edges": [self._edge_to_dict(edge) for edge in edges],
             "recent_turns": [self._turn_to_dict(turn) for turn in recent_turns],
+            "onboarding_seed": onboarding_seed,
         }
 
     def record_turn(

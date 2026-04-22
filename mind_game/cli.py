@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
+from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history
+from .onboarding import OnboardingQuestion, get_onboarding_question_order, get_onboarding_questions
 from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
-from .story_state import StoryStateStore
+from .story_state import OnboardingSessionRecord, StoryStateStore
 
 
 @dataclass(slots=True)
@@ -99,10 +103,17 @@ def main() -> int:
 
     story_store = build_story_store()
     try:
-        engine = BaseReActEngine(reasoner, story_store=story_store)
+        story_session_id, onboarding_session = _resolve_story_session(story_store)
+        if story_store is not None and onboarding_session is not None:
+            story_session_id = _run_onboarding_questionnaire(story_store, onboarding_session)
+
+        engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
 
         print(f'Mind Game chat loop ready using Ollama model "{model_name}" at {base_url}.')
         print('Type "exit" to quit.\n')
+
+        if story_store is not None and engine.story_session_id is not None:
+            _print_session_history(story_store, engine.story_session_id)
 
         while True:
             user_text = input("You > ")
@@ -115,7 +126,7 @@ def main() -> int:
                 continue
 
             result = engine.run_turn(trimmed)
-            print(f"AI  > {result.reply}\n")
+            _print_turn_messages(story_store, engine.story_session_id, trimmed, result.reply)
     except (KeyboardInterrupt, EOFError):
         print("\nGoodbye.")
     except Exception as error:  # pragma: no cover - defensive CLI guard
@@ -126,6 +137,95 @@ def main() -> int:
             story_store.close()
 
     return 0
+
+
+def _resolve_story_session(story_store: StoryStateStore | None) -> tuple[int | None, OnboardingSessionRecord | None]:
+    if story_store is None:
+        return None, None
+
+    onboarding_session = story_store.latest_incomplete_onboarding_session()
+    if onboarding_session is not None:
+        return onboarding_session.session_id, onboarding_session
+
+    orphan_onboarding_session = story_store.latest_session(status="onboarding")
+    if orphan_onboarding_session is not None:
+        onboarding_session = story_store.load_session_onboarding(orphan_onboarding_session.id)
+        if onboarding_session is None:
+            onboarding_session = story_store.create_onboarding_session(
+                orphan_onboarding_session.id,
+                question_order=get_onboarding_question_order(),
+                status="in_progress",
+            )
+        return orphan_onboarding_session.id, onboarding_session
+
+    playable_session = story_store.latest_playable_session()
+    if playable_session is not None:
+        return playable_session.id, None
+
+    session_id = story_store.create_session(status="onboarding")
+    onboarding_session = story_store.create_onboarding_session(
+        session_id,
+        question_order=get_onboarding_question_order(),
+        status="in_progress",
+    )
+    return session_id, onboarding_session
+
+
+def _run_onboarding_questionnaire(
+    story_store: StoryStateStore,
+    onboarding_session: OnboardingSessionRecord,
+) -> int:
+    questions = {question.key: question for question in get_onboarding_questions()}
+    question_order = onboarding_session.question_order or get_onboarding_question_order()
+    answered_keys = {answer.question_key for answer in onboarding_session.answers}
+    total_questions = len(question_order)
+
+    for index, question_key in enumerate(question_order):
+        if question_key in answered_keys:
+            continue
+
+        question = questions.get(question_key) or OnboardingQuestion(
+            key=question_key,
+            prompt=f"What should we know about {question_key}?",
+        )
+        print(f"[{index + 1}/{total_questions}] {question.prompt}")
+        answer = input("> ").strip()
+        story_store.record_onboarding_answer(
+            onboarding_session.id,
+            question_key=question.key,
+            question_text=question.prompt,
+            answer_index=index,
+            raw_answer_text=answer,
+            normalized_answer={question.key: answer} if answer else {},
+        )
+
+    completed = story_store.complete_onboarding_session(onboarding_session.id)
+    return completed.session_id
+
+
+def _print_session_history(story_store: StoryStateStore, session_id: int) -> None:
+    use_color = sys.stdout.isatty()
+    if not story_store.list_turns(session_id, limit=1):
+        return
+    history = render_session_history(story_store, session_id, use_color=use_color)
+    if history.strip():
+        print(history, end="")
+
+
+def _print_turn_messages(story_store: StoryStateStore, session_id: int, player_input: str, narrator_output: str) -> None:
+    use_color = sys.stdout.isatty()
+    if story_store is not None and session_id is not None:
+        messages = load_session_messages(story_store, session_id, limit=1)
+    else:
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        messages = [
+            ConsoleMessage(role="player", content=player_input, turn_number=0, created_at=created_at),
+            ConsoleMessage(role="narrator", content=narrator_output, turn_number=0, created_at=created_at),
+        ]
+
+    if messages:
+        print(render_message_batch(messages, use_color=use_color))
+        print()
 
 
 if __name__ == "__main__":

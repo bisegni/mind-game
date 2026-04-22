@@ -45,12 +45,18 @@ This todo builds on the base engine and defines the player-facing chat surface.
 
 ## Todo Items
 
-- [ ] Define the console layout and message rendering rules.
-- [ ] Define the session message schema in SQLite.
-- [ ] Define how the UI loads the message list for an existing session.
-- [ ] Define how much recent history the model should read each turn.
-- [ ] Define how summaries and memory snippets are injected into the prompt.
-- [ ] Define the scrolling and session-resume behavior.
+- [x] Define the console layout and message rendering rules.
+  Hint: render each turn as a small chat card with a clear speaker badge, a turn stamp, and a compact narrative block so the transcript feels designed, not dumped.
+- [x] Define the session message schema in SQLite.
+  Hint: keep the schema lean and replay-friendly, storing one durable turn record per exchange with role, content, scene tag, timestamp, and prompt snapshot links.
+- [x] Define how the UI loads the message list for an existing session.
+  Hint: load the stored turns in chronological order, reconstruct the visible chat feed on startup, and preserve enough metadata to resume without losing context.
+- [x] Define how much recent history the model should read each turn.
+  Hint: use a small rolling window of recent turns plus the latest compact summary so the narrator stays coherent without rereading the full transcript.
+- [x] Define how summaries and memory snippets are injected into the prompt.
+  Hint: compose the prompt from a stable system layer, a short summary block, and only the relevant memory snippets so the model gets a clean, fast context pack.
+- [x] Define the scrolling and session-resume behavior.
+  Hint: keep the transcript visually pinned to the newest exchange, but allow older turns to remain accessible above with elegant spacing and a smooth resume flow.
 
 ## Acceptance Criteria
 

@@ -187,6 +187,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(reasoner.snapshots[0]["summary_text"], "A lantern glows at the bridge.")
         self.assertEqual(reasoner.snapshots[0]["turn"], 1)
 
+    def test_engine_skips_onboarding_sessions_when_bootstrapping_from_store(self) -> None:
+        store = StoryStateStore()
+        playable_session_id = store.create_session(seed_scene_id="scene:harbor", current_scene_id="scene:harbor")
+        onboarding_session_id = store.create_session(status="onboarding")
+        store.create_onboarding_session(onboarding_session_id, question_order=["genre"])
+
+        reasoner = ScriptedReasoner([ReActDecision(kind="final", content="ready")])
+        engine = BaseReActEngine(reasoner, story_store=store)
+
+        self.assertEqual(engine.story_session_id, playable_session_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,16 @@ class StoryStateStoreTests(unittest.TestCase):
         }
 
         self.assertTrue(
-            {"sessions", "turns", "entities", "edges", "state_snapshots", "events"}.issubset(tables),
+            {
+                "sessions",
+                "turns",
+                "entities",
+                "edges",
+                "state_snapshots",
+                "events",
+                "onboarding_sessions",
+                "onboarding_answers",
+            }.issubset(tables),
         )
         self.assertTrue(
             {
@@ -36,6 +45,8 @@ class StoryStateStoreTests(unittest.TestCase):
                 "idx_edges_session_to_type",
                 "idx_state_snapshots_session_turn",
                 "idx_events_session_turn",
+                "idx_onboarding_sessions_session_updated",
+                "idx_onboarding_answers_session_index",
             }.issubset(indexes),
         )
 
@@ -114,6 +125,83 @@ class StoryStateStoreTests(unittest.TestCase):
             self.assertEqual(len(turns), 1)
             self.assertGreaterEqual(len(events), 3)
             self.assertIn("entity_ids", snapshot.graph_focus)
+
+    def test_onboarding_records_round_trip_and_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "story-state.sqlite3"
+            store = StoryStateStore(path)
+            session_id = store.create_session()
+            onboarding = store.create_onboarding_session(
+                session_id,
+                question_order=["genre", "tone", "setting"],
+            )
+            self.assertEqual(onboarding.status, "in_progress")
+            self.assertEqual(store.load_session(session_id).status, "onboarding")
+
+            first_answer = store.record_onboarding_answer(
+                onboarding.id,
+                question_key="genre",
+                question_text="What kind of story should this be?",
+                answer_index=0,
+                raw_answer_text="fog-soaked mystery",
+                normalized_answer={"genre": "fog-soaked mystery"},
+            )
+            store.record_onboarding_answer(
+                onboarding.id,
+                question_key="tone",
+                question_text="What tone do you want?",
+                answer_index=1,
+                raw_answer_text="tense but hopeful",
+                normalized_answer={"tone": "tense but hopeful"},
+            )
+            store.record_onboarding_answer(
+                onboarding.id,
+                question_key="setting",
+                question_text="Where does the story begin?",
+                answer_index=2,
+                raw_answer_text="a flooded harbor town",
+                normalized_answer={"setting": "a flooded harbor town"},
+            )
+
+            updated = store.update_onboarding_session(
+                onboarding.id,
+                generated_summary_text="Draft onboarding summary",
+            )
+            completed = store.complete_onboarding_session(onboarding.id)
+
+            store.close()
+            reopened = StoryStateStore(path)
+
+            loaded = reopened.load_onboarding_session(onboarding.id)
+            linked = reopened.load_session_onboarding(session_id)
+            session = reopened.load_session(session_id)
+            prompt_state = reopened.build_prompt_state(session_id, player_input="start", observations=[])
+
+            self.assertIsNotNone(loaded)
+            self.assertIsNotNone(linked)
+            self.assertIsNotNone(session)
+            self.assertEqual(loaded, linked)
+            self.assertEqual(loaded.status, "complete")
+            self.assertEqual(loaded.question_order, ["genre", "tone", "setting"])
+            self.assertEqual([answer.question_key for answer in loaded.answers], ["genre", "tone", "setting"])
+            self.assertEqual(first_answer.raw_answer_text, "fog-soaked mystery")
+            self.assertEqual(loaded.answers[0].normalized_answer["genre"], "fog-soaked mystery")
+            self.assertEqual(loaded.normalized_setup["genre"], "fog-soaked mystery")
+            self.assertEqual(loaded.normalized_setup["setting"], "a flooded harbor town")
+            self.assertEqual(loaded.generated_summary_text, loaded.seed_scene["summary_text"])
+            self.assertTrue(loaded.seed_scene["scene_id"].startswith(f"scene:onboarding:{onboarding.id}:"))
+            self.assertIsNotNone(loaded.completed_at)
+            self.assertEqual(updated.generated_summary_text, "Draft onboarding summary")
+            self.assertEqual(completed.status, "complete")
+            self.assertEqual(prompt_state["summary_text"], loaded.seed_scene["summary_text"])
+            self.assertEqual(prompt_state["current_scene_id"], loaded.seed_scene["scene_id"])
+            self.assertEqual(prompt_state["onboarding_seed"]["scene_id"], loaded.seed_scene["scene_id"])
+            self.assertEqual(prompt_state["onboarding_seed"]["summary_text"], loaded.seed_scene["summary_text"])
+            self.assertEqual(prompt_state["onboarding_seed"]["facts"]["genre"], "fog-soaked mystery")
+            self.assertEqual(session.status, "active")
+            self.assertEqual(session.onboarding_id, str(onboarding.id))
+            self.assertEqual(session.seed_scene_id, loaded.seed_scene["scene_id"])
+            self.assertEqual(session.current_scene_id, loaded.seed_scene["scene_id"])
 
     def test_prompt_state_compacts_recent_turns_and_graph_neighborhood(self) -> None:
         store = StoryStateStore()

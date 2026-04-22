@@ -102,7 +102,7 @@ class BaseReActEngine:
 
         if self._story_store is not None:
             if self._story_session_id is None:
-                latest_session = self._story_store.latest_session()
+                latest_session = self._story_store.latest_playable_session()
                 self._story_session_id = (
                     latest_session.id if latest_session is not None else self._story_store.create_session()
                 )
@@ -127,6 +127,10 @@ class BaseReActEngine:
     @property
     def tools(self) -> list[Tool]:
         return list(self._tools)
+
+    @property
+    def story_session_id(self) -> int | None:
+        return self._story_session_id
 
     def run_turn(self, player_input: str) -> EngineTurn:
         text = player_input.strip()

@@ -79,6 +79,36 @@ class PromptTests(unittest.TestCase):
         self.assertIn('Tool results: [{"result": "{\\"turn\\": 7}", "tool": "session.read"}]', prompt)
         self.assertIn("do not rely on or restate", prompt)
 
+    def test_build_turn_prompt_includes_compact_onboarding_seed_data(self) -> None:
+        snapshot = {
+            "turn": 0,
+            "player_input": "",
+            "current_scene_id": "scene:onboarding:12:foggy-harbor",
+            "summary_text": "You wake in a fog-soaked harbor town.",
+            "facts": {"tone": "tense", "setting": "foggy harbor"},
+            "recent_messages": [],
+            "notes": ["start with a quiet mystery"],
+            "onboarding_seed": {
+                "onboarding_id": 12,
+                "session_id": 34,
+                "scene_id": "scene:onboarding:12:foggy-harbor",
+                "summary_text": "You wake in a fog-soaked harbor town.",
+                "facts": {"genre": "mystery"},
+                "world_tags": ["mystery", "harbor"],
+                "story_promises": ["quiet mystery"],
+                "starting_state": {"text": "dockside"},
+                "memory_seed": {"question_order": ["genre", "tone"]},
+            },
+        }
+        tools = [SimpleNamespace(name="session.read", description="Return a compact session snapshot.")]
+
+        prompt = build_turn_prompt(snapshot, tools)
+
+        self.assertIn('"onboarding_seed": {"facts": {"genre": "mystery"}', prompt)
+        self.assertIn('"scene_id": "scene:onboarding:12:foggy-harbor"', prompt)
+        self.assertIn('"summary_text": "You wake in a fog-soaked harbor town."', prompt)
+        self.assertIn('"memory_seed": {"question_order": ["genre", "tone"]}', prompt)
+
     def test_normalize_user_input_trims_whitespace(self) -> None:
         self.assertEqual(normalize_user_input("  hello  "), "hello")
 

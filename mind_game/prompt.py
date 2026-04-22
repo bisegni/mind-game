@@ -60,6 +60,19 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
         "recent_messages": snapshot.get("recent_messages", []),
         "notes": snapshot.get("notes", []),
     }
+    onboarding_seed = snapshot.get("onboarding_seed")
+    if onboarding_seed:
+        compact_snapshot["onboarding_seed"] = {
+            "onboarding_id": onboarding_seed.get("onboarding_id"),
+            "session_id": onboarding_seed.get("session_id"),
+            "scene_id": onboarding_seed.get("scene_id"),
+            "summary_text": onboarding_seed.get("summary_text", ""),
+            "facts": onboarding_seed.get("facts", {}),
+            "world_tags": onboarding_seed.get("world_tags", []),
+            "story_promises": onboarding_seed.get("story_promises", []),
+            "starting_state": onboarding_seed.get("starting_state", {}),
+            "memory_seed": onboarding_seed.get("memory_seed", {}),
+        }
     return f"Compact memory: {json.dumps(compact_snapshot, sort_keys=True)}"
 
 
