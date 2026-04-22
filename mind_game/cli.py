@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
-from .prompt import build_system_prompt, is_exit_command
+from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
 
 
 @dataclass(slots=True)
@@ -28,10 +28,6 @@ class OllamaReActReasoner:
         return self._parse_decision(content)
 
     def _build_prompt(self, snapshot: Mapping[str, Any], tools: Sequence[Tool]) -> str:
-        catalog = [
-            {"name": tool.name, "description": tool.description}
-            for tool in tools
-        ]
         return "\n".join(
             [
                 "You are running a bounded ReAct turn for the Mind Game prototype.",
@@ -39,8 +35,7 @@ class OllamaReActReasoner:
                 'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"..."}.',
                 "Use tools when you need session state or bounded delegation.",
                 "Keep tool arguments small and explicit.",
-                f"Snapshot: {json.dumps(snapshot, sort_keys=True)}",
-                f"Tools: {json.dumps(catalog, sort_keys=True)}",
+                build_turn_prompt(snapshot, tools),
             ],
         )
 

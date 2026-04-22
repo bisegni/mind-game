@@ -1,6 +1,7 @@
 import io
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mind_game.engine import ReActDecision
@@ -28,6 +29,37 @@ class CliTests(unittest.TestCase):
         self.assertIn('Mind Game chat loop ready using Ollama model "test-model" at http://example.local:11434.', output)
         self.assertIn("AI  > echo:hello", output)
         build_reasoner.assert_called_once_with("test-model", "http://example.local:11434")
+
+    def test_reasoner_decide_uses_the_layered_turn_prompt_path(self) -> None:
+        class PromptRecordingModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def invoke(self, messages):
+                self.calls.append(messages)
+                return SimpleNamespace(content='{"kind":"final","content":"ready"}')
+
+        model = PromptRecordingModel()
+        reasoner = cli.OllamaReActReasoner(model=model, system_prompt="system prompt")
+        snapshot = {
+            "turn": 2,
+            "player_input": "continue",
+            "facts": {},
+            "recent_messages": [],
+            "notes": [],
+            "observations": [],
+        }
+        tools = [SimpleNamespace(name="session.read", description="Return a compact session snapshot.")]
+
+        with patch.object(cli, "build_turn_prompt", return_value="TURN PROMPT SENTINEL") as build_turn_prompt:
+            decision = reasoner.decide(snapshot, tools)
+
+        self.assertEqual(decision, ReActDecision(kind="final", content="ready"))
+        build_turn_prompt.assert_called_once_with(snapshot, tools)
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(model.calls[0][0].content, "system prompt")
+        self.assertIn("bounded ReAct turn for the Mind Game prototype", model.calls[0][1].content)
+        self.assertIn("TURN PROMPT SENTINEL", model.calls[0][1].content)
 
 
 if __name__ == "__main__":

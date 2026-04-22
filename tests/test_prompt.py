@@ -1,15 +1,62 @@
 import unittest
+from types import SimpleNamespace
 
-from mind_game.prompt import build_system_prompt, is_exit_command, normalize_user_input
+from mind_game.prompt import (
+    COMPACT_MEMORY_LAYER,
+    GAME_LOOP_LAYER,
+    NARRATOR_VOICE_LAYER,
+    PROMPT_ERROR_LAYER,
+    TOOL_CONTEXT_LAYER,
+    build_system_prompt,
+    build_turn_prompt,
+    is_exit_command,
+    normalize_user_input,
+)
 
 
 class PromptTests(unittest.TestCase):
-    def test_build_system_prompt_guides_game_design_conversation(self) -> None:
+    def test_build_system_prompt_exposes_the_layered_contract(self) -> None:
         prompt = build_system_prompt()
 
-        self.assertIn("AI-evolving game prototype", prompt)
+        self.assertIn(GAME_LOOP_LAYER, prompt)
+        self.assertIn(NARRATOR_VOICE_LAYER, prompt)
+        self.assertIn(COMPACT_MEMORY_LAYER, prompt)
+        self.assertIn(TOOL_CONTEXT_LAYER, prompt)
+        self.assertIn(PROMPT_ERROR_LAYER, prompt)
         self.assertIn("one concise question at a time", prompt)
         self.assertIn("tone, setting, challenge level", prompt)
+
+    def test_build_turn_prompt_includes_compact_memory_tool_and_error_guidance(self) -> None:
+        snapshot = {
+            "turn": 7,
+            "player_input": "look around",
+            "facts": {"tone": "playful"},
+            "recent_messages": [
+                {"role": "player", "content": "hello"},
+                {"role": "assistant", "content": "Welcome back."},
+            ],
+            "notes": ["keep the reply brief"],
+            "observations": [
+                {"tool": "session.read", "result": '{"turn": 7}'},
+            ],
+        }
+        tools = [
+            SimpleNamespace(name="session.read", description="Return a compact session snapshot."),
+            SimpleNamespace(name="subagent.delegate", description="Delegate a bounded task."),
+        ]
+
+        prompt = build_turn_prompt(snapshot, tools)
+
+        self.assertIn(GAME_LOOP_LAYER, prompt)
+        self.assertIn(NARRATOR_VOICE_LAYER, prompt)
+        self.assertIn(COMPACT_MEMORY_LAYER, prompt)
+        self.assertIn(TOOL_CONTEXT_LAYER, prompt)
+        self.assertIn(PROMPT_ERROR_LAYER, prompt)
+        self.assertIn('Compact memory: {"facts": {"tone": "playful"}', prompt)
+        self.assertIn('"recent_messages": [{"content": "hello", "role": "player"}', prompt)
+        self.assertIn('Tool catalog: [{"description": "Return a compact session snapshot.", "name": "session.read"}', prompt)
+        self.assertIn('Tool results: [{"result": "{\\"turn\\": 7}", "tool": "session.read"}]', prompt)
+        self.assertIn("do not rely on or restate", prompt)
 
     def test_normalize_user_input_trims_whitespace(self) -> None:
         self.assertEqual(normalize_user_input("  hello  "), "hello")
