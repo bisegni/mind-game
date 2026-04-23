@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import shutil
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any, Mapping, Sequence
 
 from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
 from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history, stream_message
+from .scene_renderer import render_scene_frame
+from .shell import SceneFrame as ShellSceneFrame, ShellMode, ShellStatus, render_split_pane
 from .onboarding import (
     OllamaOnboardingReasoner,
     build_onboarding_prompt_state,
@@ -144,6 +147,12 @@ def main() -> int:
         if story_store is not None and engine.story_session_id is not None:
             _print_session_history(story_store, engine.story_session_id)
             _print_opening_scene(story_store, engine.story_session_id)
+            _print_console_shell(
+                story_store,
+                engine.story_session_id,
+                model_name=model_name,
+                use_color=_console_use_color(),
+            )
 
         while True:
             user_text = input("Player > ")
@@ -155,8 +164,43 @@ def main() -> int:
             if not trimmed:
                 continue
 
-            result = engine.run_turn(trimmed)
+            if story_store is not None and engine.story_session_id is not None:
+                _print_console_shell(
+                    story_store,
+                    engine.story_session_id,
+                    model_name=model_name,
+                    mode="spinner",
+                    message="waiting for model reply",
+                    spinner_index=engine.session.turn,
+                    use_color=_console_use_color(),
+                )
+
+            try:
+                result = engine.run_turn(trimmed)
+            except Exception as error:
+                if story_store is not None and engine.story_session_id is not None:
+                    _print_console_shell(
+                        story_store,
+                        engine.story_session_id,
+                        model_name=model_name,
+                        mode="error",
+                        error=str(error),
+                        use_color=_console_use_color(),
+                    )
+                raise
             _print_turn_messages(story_store, engine.story_session_id, trimmed, result.reply)
+            if story_store is not None and engine.story_session_id is not None:
+                mode = "tool_call" if result.observations else "idle"
+                tool_name = result.observations[-1].tool if result.observations else None
+                _print_console_shell(
+                    story_store,
+                    engine.story_session_id,
+                    model_name=model_name,
+                    mode=mode,
+                    tool_name=tool_name,
+                    message="turn complete" if result.observations else "ready",
+                    use_color=_console_use_color(),
+                )
     except (KeyboardInterrupt, EOFError):
         print("\nGoodbye.")
     except Exception as error:  # pragma: no cover - defensive CLI guard
@@ -237,6 +281,7 @@ def _run_onboarding_chat(
     onboarding_reasoner: OllamaOnboardingReasoner,
 ) -> int:
     current_session = onboarding_session
+    use_color = _console_use_color()
     if current_session.answers:
         stream_message(
             ConsoleMessage(
@@ -245,6 +290,7 @@ def _run_onboarding_chat(
                 turn_number=len(current_session.answers),
                 created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
+            use_color=use_color,
         )
     else:
         stream_message(
@@ -254,6 +300,7 @@ def _run_onboarding_chat(
                 turn_number=0,
                 created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
+            use_color=use_color,
         )
 
     while True:
@@ -285,6 +332,7 @@ def _run_onboarding_chat(
                 turn_number=len(current_session.answers),
                 created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
+            use_color=use_color,
         )
         answer = input("Player > ").strip()
         if not answer:
@@ -295,6 +343,7 @@ def _run_onboarding_chat(
                     turn_number=len(current_session.answers),
                     created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 ),
+                use_color=use_color,
             )
             continue
 
@@ -360,7 +409,7 @@ def _fallback_onboarding_completion_text(normalized_setup: Mapping[str, Any]) ->
 
 
 def _print_session_history(story_store: StoryStateStore, session_id: int) -> None:
-    use_color = sys.stdout.isatty()
+    use_color = _console_use_color()
     if not story_store.list_turns(session_id, limit=1):
         return
     history = render_session_history(story_store, session_id, use_color=use_color)
@@ -369,7 +418,7 @@ def _print_session_history(story_store: StoryStateStore, session_id: int) -> Non
 
 
 def _print_turn_messages(story_store: StoryStateStore, session_id: int, player_input: str, narrator_output: str) -> None:
-    use_color = sys.stdout.isatty()
+    use_color = _console_use_color()
     if story_store is not None and session_id is not None:
         messages = load_session_messages(story_store, session_id, limit=1)
     else:
@@ -390,6 +439,7 @@ def _print_turn_messages(story_store: StoryStateStore, session_id: int, player_i
 
 
 def _print_opening_scene(story_store: StoryStateStore, session_id: int) -> None:
+    use_color = _console_use_color()
     session = story_store.load_session(session_id)
     onboarding = story_store.load_session_onboarding(session_id)
     if session is None or onboarding is None or session.current_turn != 0:
@@ -412,8 +462,168 @@ def _print_opening_scene(story_store: StoryStateStore, session_id: int) -> None:
             created_at=session.created_at,
             scene_id=session.current_scene_id,
         ),
+        use_color=use_color,
     )
     print()
+
+
+# The CLI treats the split-pane as a view over story state: transcript history stays
+# in the text log, while the shell is redrawn from the latest session snapshot.
+def _print_console_shell(
+    story_store: StoryStateStore,
+    session_id: int | None,
+    *,
+    model_name: str,
+    use_color: bool,
+    mode: ShellMode = "idle",
+    message: str | None = None,
+    tool_name: str | None = None,
+    error: str | None = None,
+    spinner_index: int = 0,
+) -> None:
+    shell_output = _render_console_shell(
+        story_store,
+        session_id,
+        model_name=model_name,
+        use_color=use_color,
+        mode=mode,
+        message=message,
+        tool_name=tool_name,
+        error=error,
+        spinner_index=spinner_index,
+    )
+    if shell_output:
+        print(shell_output)
+
+
+def _render_console_shell(
+    story_store: StoryStateStore,
+    session_id: int | None,
+    *,
+    model_name: str,
+    use_color: bool,
+    mode: ShellMode = "idle",
+    message: str | None = None,
+    tool_name: str | None = None,
+    error: str | None = None,
+    spinner_index: int = 0,
+) -> str:
+    if session_id is None:
+        return ""
+
+    width, height = _console_dimensions()
+    rail_width = 24
+    if width <= rail_width + 1:
+        return ""
+
+    status = _build_shell_status(
+        story_store,
+        session_id,
+        model_name=model_name,
+        mode=mode,
+        message=message,
+        tool_name=tool_name,
+        error=error,
+        spinner_index=spinner_index,
+    )
+    scene_frame = _build_shell_scene_frame(
+        story_store,
+        session_id,
+        width=width - rail_width - 1,
+        height=height,
+        use_color=use_color,
+    )
+    return render_split_pane(status, scene_frame, width=width, height=height, rail_width=rail_width, use_color=use_color)
+
+
+def _build_shell_status(
+    story_store: StoryStateStore,
+    session_id: int,
+    *,
+    model_name: str,
+    mode: ShellMode,
+    message: str | None,
+    tool_name: str | None,
+    error: str | None,
+    spinner_index: int,
+) -> ShellStatus:
+    session = _load_shell_session(story_store, session_id)
+    scene_id = getattr(session, "current_scene_id", None) if session is not None else None
+    turn_number = getattr(session, "current_turn", None) if session is not None else None
+    if scene_id is None:
+        snapshot = _load_shell_snapshot(story_store, session_id)
+        scene_id = getattr(snapshot, "scene_id", None) if snapshot is not None else None
+
+    return ShellStatus(
+        mode=mode,
+        turn_number=turn_number,
+        scene_id=scene_id,
+        model_name=model_name,
+        tool_name=tool_name,
+        message=message,
+        error=error,
+        spinner_index=spinner_index,
+    )
+
+
+def _build_shell_scene_frame(
+    story_store: StoryStateStore,
+    session_id: int,
+    *,
+    width: int,
+    height: int,
+    use_color: bool,
+) -> ShellSceneFrame:
+    snapshot = _load_shell_snapshot(story_store, session_id)
+    session = _load_shell_session(story_store, session_id)
+
+    if snapshot is not None:
+        frame = render_scene_frame(snapshot, width=width, height=height, use_color=use_color)
+        return ShellSceneFrame(title=None, subtitle=None, lines=frame.lines)
+
+    scene_id = getattr(session, "current_scene_id", None) if session is not None else None
+    session_turn = getattr(session, "current_turn", None) if session is not None else None
+    title = scene_id or f"Session {session_id}"
+    subtitle = "Scene snapshot unavailable yet."
+    lines = (
+        f"scene: {scene_id or 'unknown'}",
+        f"turn: {session_turn if session_turn is not None else 'idle'}",
+        "Waiting for the next scene snapshot.",
+    )
+    return ShellSceneFrame(title=title, subtitle=subtitle, lines=lines)
+
+
+def _load_shell_session(story_store: StoryStateStore, session_id: int) -> Any | None:
+    loader = getattr(story_store, "load_session", None)
+    if callable(loader):
+        session = loader(session_id)
+        if session is not None:
+            return session
+
+    fallback = getattr(story_store, "latest_playable_session", None)
+    if callable(fallback):
+        session = fallback()
+        if session is not None and getattr(session, "id", session_id) == session_id:
+            return session
+    return None
+
+
+def _load_shell_snapshot(story_store: StoryStateStore, session_id: int) -> Any | None:
+    loader = getattr(story_store, "latest_snapshot", None)
+    if not callable(loader):
+        return None
+    return loader(session_id)
+
+
+def _console_use_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _console_dimensions() -> tuple[int, int]:
+    size = shutil.get_terminal_size(fallback=(96, 20))
+    width = max(48, size.columns)
+    height = max(12, min(size.lines - 6, 20))
+    return width, height
 
 
 if __name__ == "__main__":

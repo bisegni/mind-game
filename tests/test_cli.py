@@ -218,6 +218,61 @@ class CliTests(unittest.TestCase):
             self.assertEqual([turn.player_input for turn in turns], ["hello"])
             self.assertEqual(session.current_turn, 1)
 
+    def test_no_color_disables_transcript_and_opening_scene_color(self) -> None:
+        class TtyBuffer(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        class OpeningSceneStore:
+            def load_session(self, session_id):
+                return SimpleNamespace(
+                    id=session_id,
+                    current_turn=0,
+                    created_at="2026-04-22T16:00:00Z",
+                    current_scene_id="scene:harbor",
+                )
+
+            def load_session_onboarding(self, session_id):
+                return SimpleNamespace(
+                    seed_scene={
+                        "opening_prompt": "Opening scene",
+                        "summary_text": "Opening scene",
+                    },
+                    generated_summary_text="Opening scene",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "story.sqlite3"
+            store = StoryStateStore(path)
+            session_id = store.create_session(current_scene_id="scene:harbor")
+            prompt_state = store.build_prompt_state(session_id, player_input="look around", observations=[])
+            store.record_turn(
+                session_id,
+                turn_number=0,
+                player_input="look around",
+                narrator_output="The harbor glows in the fog.",
+                prompt_state=prompt_state,
+                scene_id="scene:harbor",
+            )
+
+            buffer = TtyBuffer()
+            with patch.dict("os.environ", {"NO_COLOR": "1"}, clear=True):
+                with patch.object(cli.sys, "stdout", buffer):
+                    cli._print_session_history(store, session_id)
+                    history_output = buffer.getvalue()
+
+                    buffer.seek(0)
+                    buffer.truncate(0)
+                    cli._print_opening_scene(OpeningSceneStore(), session_id)
+                    opening_scene_output = buffer.getvalue()
+
+            store.close()
+
+        self.assertNotIn("\x1b[", history_output)
+        self.assertIn("Player", history_output)
+        self.assertNotIn("\x1b[", opening_scene_output)
+        self.assertIn("Opening scene", opening_scene_output)
+
     def test_main_recovers_orphan_onboarding_session_before_creating_a_new_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "story.sqlite3"
@@ -519,6 +574,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("Session", output)
             self.assertIn("look around", output)
             self.assertIn("The harbor lights glow through the mist.", output)
+            self.assertIn("STATUS", output)
             self.assertIn("Player", output)
             self.assertIn("Narrator", output)
             self.assertIn("echo:hello", output)
