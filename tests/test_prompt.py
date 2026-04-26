@@ -23,6 +23,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn(COMPACT_MEMORY_LAYER, prompt)
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
+        self.assertIn("10-18 ASCII-only lines", prompt)
+        self.assertIn("terminal map panel", prompt)
+        self.assertIn("landmarks, exits", prompt)
         self.assertIn("one concise question at a time", prompt)
         self.assertIn("tone, setting, challenge level", prompt)
 
@@ -33,6 +36,7 @@ class PromptTests(unittest.TestCase):
             "current_scene_id": "scene:harbor",
             "current_summary_id": 42,
             "summary_text": "A beacon cuts through the fog.",
+            "scene_viewport": {"cols": 80, "rows": 18},
             "facts": {"tone": "playful"},
             "recent_messages": [
                 {"role": "player", "content": "hello"},
@@ -71,7 +75,26 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"turn_number": 0', prompt)
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
+        self.assertIn("redraw_only", prompt)
+        self.assertIn("scene_viewport.cols x scene_viewport.rows", prompt)
+        self.assertIn("compact spatial layout", prompt)
+        self.assertIn("current player position", prompt)
+        self.assertIn("hard layout targets", prompt)
+        self.assertIn("use all available rows and columns", prompt)
+        self.assertIn("full-canvas map", prompt)
+        self.assertIn("boxed mini-map", prompt)
+        self.assertIn("fill the panel with a spatial map", prompt)
+        self.assertIn("avoid small centered drawings", prompt)
+        self.assertIn("left, center, right, top, middle, and bottom", prompt)
+        self.assertIn("avoid legends unless they are short", prompt)
+        self.assertIn("@ for player", prompt)
+        self.assertIn("? for unknown exit", prompt)
+        self.assertIn("* for point of interest", prompt)
+        self.assertIn("=/- for corridors", prompt)
+        self.assertIn("# for walls or structure", prompt)
+        self.assertIn("never include a title or scene name line", prompt)
         self.assertIn('"current_scene_id": "scene:harbor"', prompt)
+        self.assertIn('"scene_viewport": {"cols": 80, "rows": 18}', prompt)
         self.assertIn('"summary_text": "A beacon cuts through the fog."', prompt)
         self.assertIn('"facts": {"tone": "playful"}', prompt)
         self.assertIn('"recent_messages": [{"content": "hello", "role": "player"}', prompt)

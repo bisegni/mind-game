@@ -171,7 +171,7 @@ class StoryStateStore:
     ) -> None:
         if connection is None:
             db_path = os.fspath(path) if path is not None else ":memory:"
-            connection = sqlite3.connect(db_path)
+            connection = sqlite3.connect(db_path, check_same_thread=False)
 
         self._connection = connection
         self._connection.row_factory = sqlite3.Row
@@ -1220,6 +1220,7 @@ class StoryStateStore:
         if snapshot is None and onboarding_seed:
             snapshot_state = {
                 "summary_text": onboarding_seed.get("summary_text", ""),
+                "scene_ascii": onboarding_seed.get("scene_ascii", ""),
                 "facts": dict(onboarding_seed.get("facts", {})),
                 "notes": list(onboarding_seed.get("story_promises", [])),
                 "recent_messages": [],
@@ -1228,6 +1229,7 @@ class StoryStateStore:
         facts = dict(snapshot_state.get("facts", {}))
         notes = list(snapshot_state.get("notes", []))
         summary_text = str(snapshot_state.get("summary_text", ""))
+        scene_ascii = str(snapshot_state.get("scene_ascii", ""))
         current_scene_id = session.current_scene_id if session.current_scene_id is not None else None
         if current_scene_id is None and snapshot is not None:
             current_scene_id = snapshot.scene_id
@@ -1249,6 +1251,7 @@ class StoryStateStore:
             "current_scene_id": current_scene_id,
             "current_summary_id": session.current_summary_id,
             "summary_text": snapshot.summary_text if snapshot is not None else summary_text,
+            "scene_ascii": scene_ascii,
             "facts": facts,
             "notes": notes,
             "recent_messages": recent_messages,
@@ -1275,6 +1278,7 @@ class StoryStateStore:
         consequences: Sequence[str] | None = None,
         observations: Sequence[Mapping[str, Any]] | Sequence[Any] = (),
         scene_id: str | None = None,
+        scene_ascii: str = "",
     ) -> StoryTurnRecord:
         now = _now()
         resolved_scene_id = scene_id
@@ -1433,6 +1437,7 @@ class StoryStateStore:
                 facts=facts,
                 notes=notes,
                 scene_id=resolved_scene_id,
+                scene_ascii=scene_ascii,
                 focus_entity_ids=focus_entity_ids,
                 observations=observations,
             )
@@ -1494,6 +1499,7 @@ class StoryStateStore:
         scene_id: str | None,
         focus_entity_ids: Sequence[int],
         observations: Sequence[Mapping[str, Any]] | Sequence[Any],
+        scene_ascii: str,
     ) -> dict[str, Any]:
         recent_messages = _as_list(prompt_state.get("recent_messages", []))
         recent_messages.extend(
@@ -1511,6 +1517,7 @@ class StoryStateStore:
             "recent_messages": recent_messages,
             "observations": self._normalize_observations(observations),
             "summary_text": self._summarize(narrator_output),
+            "scene_ascii": str(scene_ascii or prompt_state.get("scene_ascii") or ""),
             "graph_focus": {
                 "entity_ids": list(dict.fromkeys(int(entity_id) for entity_id in focus_entity_ids)),
             },

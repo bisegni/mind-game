@@ -486,6 +486,44 @@ class CliTests(unittest.TestCase):
         self.assertIn("bounded ReAct turn for the Mind Game prototype", model.calls[0][1].content)
         self.assertIn("TURN PROMPT SENTINEL", model.calls[0][1].content)
 
+    def test_reasoner_decide_accepts_final_scene_ascii_payload(self) -> None:
+        class PromptRecordingModel:
+            def invoke(self, messages):
+                return SimpleNamespace(
+                    content='{"kind":"final","content":"The hatch opens.","scene_ascii":"+---+\\n| * |\\n+---+"}',
+                )
+
+        reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
+
+        messages_module = ModuleType("langchain_core.messages")
+
+        class FakeSystemMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeHumanMessage:
+            def __init__(self, content):
+                self.content = content
+
+        messages_module.SystemMessage = FakeSystemMessage
+        messages_module.HumanMessage = FakeHumanMessage
+
+        langchain_core_module = ModuleType("langchain_core")
+        langchain_core_module.messages = messages_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "langchain_core": langchain_core_module,
+                "langchain_core.messages": messages_module,
+            },
+        ):
+            decision = reasoner.decide({"player_input": "open"}, [])
+
+        self.assertEqual(decision.kind, "final")
+        self.assertEqual(decision.content, "The hatch opens.")
+        self.assertIn("| * |", decision.scene_ascii)
+
     def test_onboarding_reasoner_returns_plain_text_when_model_emits_structured_content(self) -> None:
         class PromptRecordingModel:
             def __init__(self) -> None:
@@ -575,6 +613,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("look around", output)
             self.assertIn("The harbor lights glow through the mist.", output)
             self.assertIn("STATUS", output)
+            self.assertIn("note: waiting for model", output)
             self.assertIn("Player", output)
             self.assertIn("Narrator", output)
             self.assertIn("echo:hello", output)

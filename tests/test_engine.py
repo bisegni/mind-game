@@ -81,6 +81,28 @@ class EngineTests(unittest.TestCase):
         self.assertIn("session.add_note", tool_names)
         self.assertIn("subagent.delegate", tool_names)
 
+    def test_run_turn_includes_scene_viewport_hint_when_present(self) -> None:
+        reasoner = ScriptedReasoner([ReActDecision(kind="final", content="done")])
+        engine = BaseReActEngine(reasoner)
+        engine.scene_viewport_size = {"cols": 88, "rows": 20}
+
+        engine.run_turn("look around")
+
+        self.assertEqual(reasoner.snapshots[0]["scene_viewport"], {"cols": 88, "rows": 20})
+
+    def test_redraw_scene_returns_scene_ascii_without_advancing_state(self) -> None:
+        reasoner = ScriptedReasoner(
+            [ReActDecision(kind="final", content="", scene_ascii="+--+\n|@?|\n+--+")],
+        )
+        engine = BaseReActEngine(reasoner)
+
+        ascii_art = engine.redraw_scene(viewport={"cols": 64, "rows": 12})
+
+        self.assertEqual(ascii_art, "+--+\n|@?|\n+--+")
+        self.assertEqual(engine.session.turn, 0)
+        self.assertEqual(reasoner.snapshots[0]["scene_viewport"], {"cols": 64, "rows": 12})
+        self.assertTrue(reasoner.snapshots[0]["redraw_only"])
+
     def test_run_turn_persists_compact_story_state_when_store_is_configured(self) -> None:
         store = StoryStateStore()
         session_id = store.create_session(seed_scene_id="scene:harbor", current_scene_id="scene:harbor")
@@ -136,7 +158,11 @@ class EngineTests(unittest.TestCase):
                         arguments={"key": "signal", "value": "open"},
                     ),
                 ),
-                ReActDecision(kind="final", content="The fog parts around the beacon light."),
+                ReActDecision(
+                    kind="final",
+                    content="The fog parts around the beacon light.",
+                    scene_ascii="/\\ beacon /\\\n~~ fog ~~",
+                ),
             ],
         )
         engine = BaseReActEngine(reasoner, story_store=store, session_id=session_id)
@@ -161,6 +187,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(persisted_turns), 2)
         self.assertEqual(persisted_snapshot.summary_text, "The fog parts around the beacon light.")
         self.assertEqual(persisted_snapshot.state["facts"]["signal"], "open")
+        self.assertEqual(persisted_snapshot.state["scene_ascii"], "/\\ beacon /\\\n~~ fog ~~")
+        self.assertEqual(
+            store.build_prompt_state(session_id, player_input="continue")["scene_ascii"],
+            "/\\ beacon /\\\n~~ fog ~~",
+        )
         self.assertTrue(any(event.event_type == "fact" for event in persisted_events))
 
     def test_engine_uses_latest_stored_session_when_session_id_is_omitted(self) -> None:

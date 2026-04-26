@@ -27,6 +27,7 @@ class ToolCall:
 class ReActDecision:
     kind: DecisionKind
     content: str = ""
+    scene_ascii: str = ""
     tool: ToolCall | None = None
 
 
@@ -79,6 +80,7 @@ class EngineTurn:
     player_input: str
     reply: str
     observations: list[ToolObservation]
+    scene_ascii: str = ""
 
 
 class BaseReActEngine:
@@ -99,6 +101,7 @@ class BaseReActEngine:
         self._tools = list(tools or self._build_default_tools())
         self._tool_index = {tool.name: tool for tool in self._tools}
         self._max_steps = max_steps
+        self.scene_viewport_size: Mapping[str, int] | None = None
 
         if self._story_store is not None:
             if self._story_session_id is None:
@@ -154,6 +157,7 @@ class BaseReActEngine:
                 continue
 
             reply = decision.content.strip()
+            scene_ascii = decision.scene_ascii.strip()
             self.session.transcript.append(GameMessage(role="assistant", content=reply))
             self.session.turn += 1
             if self._story_store is not None and self._story_session_id is not None:
@@ -167,10 +171,23 @@ class BaseReActEngine:
                     notes=list(self.session.notes),
                     observations=observations,
                     consequences=[observation.result for observation in observations if observation.result],
+                    scene_ascii=scene_ascii,
                 )
-            return EngineTurn(player_input=text, reply=reply, observations=observations)
+            return EngineTurn(player_input=text, reply=reply, observations=observations, scene_ascii=scene_ascii)
 
         raise RuntimeError("ReAct loop exceeded the configured step limit")
+
+    def redraw_scene(self, *, viewport: Mapping[str, int]) -> str:
+        """Ask the reasoner for a fresh scene_ascii sized to the new viewport."""
+        self.scene_viewport_size = dict(viewport)
+        context = ToolContext(session=self.session, player_input="")
+        snapshot = self._snapshot(context, [])
+        snapshot["redraw_only"] = True
+        snapshot["player_input"] = ""
+        decision = self._reasoner.decide(snapshot, self._tools)
+        if decision.kind != "final":
+            return ""
+        return decision.scene_ascii.strip()
 
     def _build_default_tools(self) -> list[Tool]:
         return [
@@ -215,9 +232,11 @@ class BaseReActEngine:
                 {"name": tool.name, "description": tool.description}
                 for tool in self._tools
             ]
+            if self.scene_viewport_size:
+                snapshot["scene_viewport"] = dict(self.scene_viewport_size)
             return snapshot
 
-        return {
+        snapshot = {
             "turn": self.session.turn,
             "player_input": context.player_input,
             "facts": dict(self.session.facts),
@@ -235,6 +254,9 @@ class BaseReActEngine:
                 for tool in self._tools
             ],
         }
+        if self.scene_viewport_size:
+            snapshot["scene_viewport"] = dict(self.scene_viewport_size)
+        return snapshot
 
     def _dispatch_tool(self, context: ToolContext, call: ToolCall) -> str:
         tool = self._tool_index.get(call.name)

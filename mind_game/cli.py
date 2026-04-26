@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import shutil
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +50,7 @@ class OllamaReActReasoner:
             [
                 "You are running a bounded ReAct turn for the Mind Game prototype.",
                 "Choose exactly one action per response.",
-                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"..."}.',
+                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"...","scene_ascii":"..."}.',
                 "Use tools when you need session state or bounded delegation.",
                 "Keep tool arguments small and explicit.",
                 build_turn_prompt(snapshot, tools),
@@ -78,7 +79,8 @@ class OllamaReActReasoner:
             )
 
         content_text = str(payload.get("content") or payload.get("final") or text).strip()
-        return ReActDecision(kind="final", content=content_text)
+        scene_ascii = str(payload.get("scene_ascii") or "").strip()
+        return ReActDecision(kind="final", content=content_text, scene_ascii=scene_ascii)
 
 
 def build_reasoner(model_name: str, base_url: str) -> OllamaReActReasoner:
@@ -140,6 +142,16 @@ def main() -> int:
             story_session_id = _run_onboarding_chat(story_store, onboarding_session, onboarding_reasoner)
 
         engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
+
+        if sys.stdout.isatty() and os.environ.get("MIND_GAME_LEGACY_CLI", "").lower() not in {"1", "true", "yes"}:
+            try:
+                from .tui import MindGameApp
+            except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
+                print(f"Missing dependency: {error}. Install with `python -m pip install -e .`.")
+                return 1
+
+            MindGameApp(engine=engine, story_store=story_store, model_name=model_name, base_url=base_url).run()
+            return 0
 
         print(f'Mind Game chat loop ready using Ollama model "{model_name}" at {base_url}.')
         print('Type "exit" to quit.\n')
@@ -475,25 +487,51 @@ def _print_console_shell(
     *,
     model_name: str,
     use_color: bool,
+    movie_frames: int = 1,
     mode: ShellMode = "idle",
     message: str | None = None,
     tool_name: str | None = None,
     error: str | None = None,
     spinner_index: int = 0,
 ) -> None:
-    shell_output = _render_console_shell(
-        story_store,
-        session_id,
-        model_name=model_name,
-        use_color=use_color,
-        mode=mode,
-        message=message,
-        tool_name=tool_name,
-        error=error,
-        spinner_index=spinner_index,
-    )
-    if shell_output:
-        print(shell_output)
+    should_animate = movie_frames > 1 and sys.stdout.isatty()
+    if not should_animate:
+        shell_output = _render_console_shell(
+            story_store,
+            session_id,
+            model_name=model_name,
+            use_color=use_color,
+            mode=mode,
+            message=message,
+            tool_name=tool_name,
+            error=error,
+            spinner_index=spinner_index,
+            frame_index=0,
+        )
+        if shell_output:
+            print(shell_output)
+        return
+
+    print("\x1b[s", end="")
+    for frame_index in range(movie_frames):
+        shell_output = _render_console_shell(
+            story_store,
+            session_id,
+            model_name=model_name,
+            use_color=use_color,
+            mode=mode,
+            message=message,
+            tool_name=tool_name,
+            error=error,
+            spinner_index=spinner_index + frame_index,
+            frame_index=frame_index,
+        )
+        if not shell_output:
+            continue
+        print("\x1b[u" + shell_output, end="")
+        if frame_index < movie_frames - 1:
+            time.sleep(0.05)
+    print()
 
 
 def _render_console_shell(
@@ -502,6 +540,7 @@ def _render_console_shell(
     *,
     model_name: str,
     use_color: bool,
+    frame_index: int = 0,
     mode: ShellMode = "idle",
     message: str | None = None,
     tool_name: str | None = None,
@@ -532,6 +571,7 @@ def _render_console_shell(
         width=width - rail_width - 1,
         height=height,
         use_color=use_color,
+        frame_index=frame_index,
     )
     return render_split_pane(status, scene_frame, width=width, height=height, rail_width=rail_width, use_color=use_color)
 
@@ -573,12 +613,13 @@ def _build_shell_scene_frame(
     width: int,
     height: int,
     use_color: bool,
+    frame_index: int,
 ) -> ShellSceneFrame:
     snapshot = _load_shell_snapshot(story_store, session_id)
     session = _load_shell_session(story_store, session_id)
 
     if snapshot is not None:
-        frame = render_scene_frame(snapshot, width=width, height=height, use_color=use_color)
+        frame = render_scene_frame(snapshot, width=width, height=height, use_color=use_color, frame_index=frame_index)
         return ShellSceneFrame(title=None, subtitle=None, lines=frame.lines)
 
     scene_id = getattr(session, "current_scene_id", None) if session is not None else None

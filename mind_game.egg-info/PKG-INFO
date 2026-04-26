@@ -5,3 +5,4 @@ Summary: A tiny Ollama-powered conversation loop for an evolving game prototype.
 Requires-Python: >=3.11
 Requires-Dist: langchain-core>=0.3.0
 Requires-Dist: langchain-ollama>=0.2.0
+Requires-Dist: textual>=0.86.0

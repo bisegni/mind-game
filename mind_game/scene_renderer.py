@@ -40,6 +40,7 @@ def render_scene_frame(
     width: int = 72,
     height: int = 20,
     use_color: bool = True,
+    frame_index: int = 0,
     theme: SceneTheme = DEFAULT_SCENE_THEME,
 ) -> SceneFrame:
     data = _coerce_snapshot(snapshot)
@@ -58,6 +59,7 @@ def render_scene_frame(
     focus_ids = _focus_entity_ids(data.get("graph_focus") or _lookup(state, "graph_focus"))
 
     sections.extend(_label_lines("scene", [scene_id], inner_width))
+    sections.extend(_motion_lines(scene_id, inner_width, frame_index))
     sections.extend(_label_lines("summary", _wrap_text(summary_text, inner_width), inner_width))
 
     if facts:
@@ -94,6 +96,7 @@ def render_scene_text(
     width: int = 72,
     height: int = 20,
     use_color: bool = True,
+    frame_index: int = 0,
     theme: SceneTheme = DEFAULT_SCENE_THEME,
 ) -> str:
     return render_scene_frame(
@@ -101,6 +104,7 @@ def render_scene_text(
         width=width,
         height=height,
         use_color=use_color,
+        frame_index=frame_index,
         theme=theme,
     ).text
 
@@ -232,6 +236,38 @@ def _clip_lines(lines: Sequence[str], height: int) -> list[str]:
     clipped = list(lines[: height - 1])
     clipped.append("...")
     return clipped
+
+
+def _motion_lines(scene_id: str, width: int, frame_index: int) -> list[str]:
+    if frame_index <= 0 or width < 8:
+        return []
+
+    seed = sum(ord(char) for char in scene_id)
+    phase = seed + frame_index * 7
+    star_line = [" "] * width
+    wave_line = [" "] * width
+    pulse_line = [" "] * width
+
+    for index in range(0, width, 6):
+        star_line[(index + phase) % width] = "."
+
+    wave_span = max(3, width // 5)
+    wave_start = phase % max(1, width - wave_span)
+    for index in range(wave_start, min(width, wave_start + wave_span)):
+        wave_line[index] = "~"
+
+    hatch_width = max(4, min(width // 4, 12))
+    hatch_start = phase % max(1, width - hatch_width)
+    hatch = "/\\__/"[:hatch_width]
+    for offset, char in enumerate(hatch):
+        if hatch_start + offset < width:
+            pulse_line[hatch_start + offset] = char
+
+    return [
+        "".join(star_line),
+        "".join(pulse_line),
+        "".join(wave_line),
+    ]
 
 
 def _format_line(line: str, width: int, *, use_color: bool, theme: SceneTheme) -> str:

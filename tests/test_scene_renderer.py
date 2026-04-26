@@ -80,6 +80,23 @@ class SceneRendererTests(unittest.TestCase):
             self.assertNotIn("\x1b[", monochrome)
             self.assertIn("\x1b[", colored)
 
+    def test_render_scene_frame_motion_phase_changes_the_ascii_canvas(self) -> None:
+        snapshot = {
+            "scene_id": "scene:harbor",
+            "summary_text": "A beacon cuts through the fog.",
+            "state": {
+                "facts": {"weather": "foggy"},
+            },
+            "graph_focus": {"entity_ids": [7]},
+        }
+
+        base = render_scene_frame(snapshot, width=48, height=16, use_color=False, frame_index=0)
+        animated = render_scene_frame(snapshot, width=48, height=16, use_color=False, frame_index=1)
+
+        self.assertNotEqual(base.text, animated.text)
+        self.assertIn("~", animated.text)
+        self.assertIn(".", animated.text)
+
 
 if __name__ == "__main__":
     unittest.main()
