@@ -3,7 +3,9 @@ import unittest
 from mind_game.engine import (
     BaseReActEngine,
     ReActDecision,
+    StreamChunk,
     SubagentTask,
+    TokenUsage,
     ToolCall,
 )
 from mind_game.story_state import StoryEdgeDraft, StoryEntityDraft, StoryStateStore
@@ -230,5 +232,70 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.story_session_id, playable_session_id)
 
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_stream_map_invokes_callback_with_growing_buffer(self) -> None:
+        chunks = ["+--", "+\n|@", "|\n+--+"]
+
+        class StreamingReasoner(ScriptedReasoner):
+            def stream_map(self, snapshot, viewport):
+                return iter(chunks)
+
+        reasoner = StreamingReasoner([])
+        engine = BaseReActEngine(reasoner)
+
+        received: list[str] = []
+        final = engine.stream_map(viewport={"cols": 40, "rows": 8}, on_chunk=received.append)
+
+        self.assertEqual(final, "+--+\n|@|\n+--+")
+        self.assertEqual(received[0], "+--")
+        self.assertEqual(received[1], "+--+\n|@")
+        self.assertEqual(received[2], "+--+\n|@|\n+--+")
+
+    def test_stream_map_passes_usage_chunks_to_callback(self) -> None:
+        usage = TokenUsage(prompt_tokens=5, completion_tokens=3, total_tokens=8)
+
+        class StreamingReasoner(ScriptedReasoner):
+            def stream_map(self, snapshot, viewport):
+                return iter([StreamChunk(content="+--", usage=usage), StreamChunk(content="+")])
+
+        engine = BaseReActEngine(StreamingReasoner([]))
+        received: list[object] = []
+
+        final = engine.stream_map(viewport={"cols": 40, "rows": 8}, on_chunk=received.append)
+
+        self.assertEqual(final, "+--+")
+        self.assertIsInstance(received[0], StreamChunk)
+        self.assertEqual(received[0].content, "+--")
+        self.assertEqual(received[0].usage, usage)
+        self.assertEqual(received[1], "+--+")
+
+    def test_stream_map_persists_final_ascii_into_latest_snapshot(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:vault")
+        prompt_state = store.build_prompt_state(session_id, player_input="start", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="start",
+            narrator_output="The vault door seals shut.",
+            prompt_state=prompt_state,
+            scene_id="scene:vault",
+        )
+
+        class StreamingReasoner:
+            def stream_map(self, snapshot, viewport):
+                return iter(["+VAULT+\n|@.....|\n+------+"])
+
+        engine = BaseReActEngine(StreamingReasoner(), story_store=store, session_id=session_id)
+        engine.stream_map(viewport={"cols": 40, "rows": 8})
+
+        snapshot = store.latest_snapshot(session_id)
+        self.assertEqual(snapshot.state["scene_ascii"], "+VAULT+\n|@.....|\n+------+")
+
+    def test_stream_map_returns_empty_when_reasoner_lacks_stream_map(self) -> None:
+        reasoner = ScriptedReasoner([])
+        engine = BaseReActEngine(reasoner)
+
+        result = engine.stream_map(viewport={"cols": 40, "rows": 8})
+
+        self.assertEqual(result, "")
+

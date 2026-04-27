@@ -300,6 +300,35 @@ class StoryStateStoreTests(unittest.TestCase):
         )
         self.assertIsNone(store.latest_snapshot(session_id))
 
+    def test_update_latest_scene_ascii_patches_only_scene_ascii(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:lab")
+        prompt_state = store.build_prompt_state(session_id, player_input="start", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="start",
+            narrator_output="The lab hums.",
+            prompt_state=prompt_state,
+            scene_id="scene:lab",
+            facts={"power": "on"},
+        )
+
+        store.update_latest_scene_ascii(session_id, "+LAB+\n|@..|\n+---+")
+
+        snapshot = store.latest_snapshot(session_id)
+        self.assertEqual(snapshot.state["scene_ascii"], "+LAB+\n|@..|\n+---+")
+        # Other state keys must survive the patch.
+        self.assertEqual(snapshot.state["facts"]["power"], "on")
+
+    def test_update_latest_scene_ascii_returns_false_when_no_snapshot(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session()
+
+        result = store.update_latest_scene_ascii(session_id, "+--+")
+
+        self.assertFalse(result)
+
 
 if __name__ == "__main__":
     unittest.main()

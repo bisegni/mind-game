@@ -9,8 +9,12 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
-from .engine import BaseReActEngine, ReActDecision, Tool, ToolCall
+from .diagnostics import configure_logging, get_logger
+from .engine import BaseReActEngine, ReActDecision, StreamChunk, TokenUsage, Tool, ToolCall
 from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history, stream_message
 from .scene_renderer import render_scene_frame
 from .shell import SceneFrame as ShellSceneFrame, ShellMode, ShellStatus, render_split_pane
@@ -23,27 +27,159 @@ from .onboarding import (
     required_field_prompt,
     REQUIRED_ONBOARDING_FIELDS,
 )
-from .prompt import build_system_prompt, build_turn_prompt, is_exit_command
+from .prompt import (
+    MAP_SYSTEM_PROMPT,
+    build_map_prompt,
+    build_system_prompt,
+    build_turn_prompt,
+    is_exit_command,
+)
 from .story_state import OnboardingSessionRecord, StoryStateStore
 
 
-@dataclass(slots=True)
-class OllamaReActReasoner:
-    model: Any
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatResponse:
+    content: str
+    usage: TokenUsage | None = None
+
+
+class OpenAICompatibleChatClient:
+    def __init__(self, *, model: str, base_url: str, temperature: float = 0.7, timeout: float = 120.0) -> None:
+        self.model = model
+        self.base_url = normalize_openai_base_url(base_url)
+        self.temperature = temperature
+        self.timeout = timeout
+
+    def invoke(self, messages: Sequence[Any]) -> ChatResponse:
+        payload = self._payload(messages, stream=False)
+        logger.info("chat invoke start endpoint=%s model=%s", openai_chat_completions_endpoint(self.base_url), self.model)
+        response = _post_json(openai_chat_completions_endpoint(self.base_url), payload, timeout=self.timeout)
+        logger.info("chat invoke done model=%s usage=%s", self.model, response.get("usage") if isinstance(response, Mapping) else None)
+        choices = response.get("choices") if isinstance(response, Mapping) else None
+        content = ""
+        if isinstance(choices, Sequence) and choices and not isinstance(choices, (str, bytes, bytearray)):
+            first = choices[0]
+            if isinstance(first, Mapping):
+                message = first.get("message")
+                if isinstance(message, Mapping):
+                    content = str(message.get("content") or "")
+                else:
+                    content = str(first.get("text") or "")
+        return ChatResponse(content=content, usage=_parse_usage(response.get("usage") if isinstance(response, Mapping) else None))
+
+    def stream(self, messages: Sequence[Any]):
+        payload = self._payload(messages, stream=True)
+        endpoint = openai_chat_completions_endpoint(self.base_url)
+        request = _json_request(endpoint, payload, accept="text/event-stream")
+        logger.info("chat stream start endpoint=%s model=%s", endpoint, self.model)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                content_type = _response_content_type(response)
+                logger.info(
+                    "chat stream response endpoint=%s status=%s content_type=%s",
+                    endpoint,
+                    getattr(response, "status", None),
+                    content_type,
+                )
+                if "text/event-stream" not in content_type:
+                    item = _read_json_response(response)
+                    content = _response_message_content(item)
+                    usage = _parse_response_usage(item)
+                    logger.info(
+                        "chat stream json response endpoint=%s chars=%s usage=%s",
+                        endpoint,
+                        len(content),
+                        usage,
+                    )
+                    if content or usage is not None:
+                        yield StreamChunk(content=content, usage=usage)
+                    return
+
+                chunk_count = 0
+                generated_chunks = 0
+                for event in _iter_sse_events(response):
+                    if event == "[DONE]":
+                        logger.info("chat stream done marker endpoint=%s chunks=%s", endpoint, chunk_count)
+                        break
+                    try:
+                        item = json.loads(event)
+                    except json.JSONDecodeError:
+                        logger.warning("chat stream malformed event endpoint=%s event_prefix=%r", endpoint, event[:120])
+                        continue
+                    content = _stream_delta_content(item)
+                    usage = _parse_response_usage(item)
+                    if content or usage is not None:
+                        if content and usage is None:
+                            generated_chunks += 1
+                            usage = TokenUsage(generated_tokens=generated_chunks)
+                        elif usage is not None and usage.generated_tokens is not None:
+                            generated_chunks = usage.generated_tokens
+                        chunk_count += 1
+                        logger.debug(
+                            "chat stream chunk endpoint=%s chunk=%s chars=%s usage=%s",
+                            endpoint,
+                            chunk_count,
+                            len(content),
+                            usage,
+                        )
+                        yield StreamChunk(content=content, usage=usage)
+                logger.info("chat stream finished endpoint=%s chunks=%s", endpoint, chunk_count)
+        except (OSError, URLError) as error:
+            logger.exception("chat stream failed endpoint=%s", endpoint)
+            raise RuntimeError(f"Unable to stream chat completion from {endpoint}: {error}") from error
+
+    def _payload(self, messages: Sequence[Any], *, stream: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [_message_payload(message) for message in messages],
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        return payload
+
+
+@dataclass(init=False, slots=True)
+class OpenAICompatibleReActReasoner:
+    client: OpenAICompatibleChatClient
     system_prompt: str
 
-    def decide(self, snapshot: Mapping[str, Any], tools: Sequence[Tool]) -> ReActDecision:
-        from langchain_core.messages import HumanMessage, SystemMessage
+    def __init__(
+        self,
+        client: OpenAICompatibleChatClient | None = None,
+        *,
+        model: Any | None = None,
+        system_prompt: str,
+    ) -> None:
+        self.client = client if client is not None else model
+        self.system_prompt = system_prompt
 
+    def decide(self, snapshot: Mapping[str, Any], tools: Sequence[Tool]) -> ReActDecision:
         prompt = self._build_prompt(snapshot, tools)
-        response = self.model.invoke(
+        response = self.client.invoke(
             [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=prompt),
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
             ],
         )
         content = response.content if isinstance(response.content, str) else str(response.content)
-        return self._parse_decision(content)
+        decision = self._parse_decision(content)
+        decision.usage = getattr(response, "usage", None)
+        return decision
+
+    def stream_map(self, snapshot: Mapping[str, Any], viewport: Mapping[str, int] | None = None):
+        prompt = build_map_prompt(snapshot, viewport)
+        for chunk in self.client.stream(
+            [
+                {"role": "system", "content": MAP_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        ):
+            yield chunk
 
     def _build_prompt(self, snapshot: Mapping[str, Any], tools: Sequence[Tool]) -> str:
         return "\n".join(
@@ -83,34 +219,27 @@ class OllamaReActReasoner:
         return ReActDecision(kind="final", content=content_text, scene_ascii=scene_ascii)
 
 
-def build_reasoner(model_name: str, base_url: str) -> OllamaReActReasoner:
-    try:
-        from langchain_ollama import ChatOllama
-    except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
-        raise ModuleNotFoundError(error.name) from error
+OllamaReActReasoner = OpenAICompatibleReActReasoner
 
-    model = ChatOllama(
+
+def build_reasoner(model_name: str, base_url: str) -> OpenAICompatibleReActReasoner:
+    client = OpenAICompatibleChatClient(
         model=model_name,
         base_url=base_url,
         temperature=0.7,
-        max_retries=2,
+        timeout=30.0,
     )
-    return OllamaReActReasoner(model=model, system_prompt=build_system_prompt())
+    return OpenAICompatibleReActReasoner(client=client, system_prompt=build_system_prompt())
 
 
 def build_onboarding_reasoner(model_name: str, base_url: str) -> OllamaOnboardingReasoner:
-    try:
-        from langchain_ollama import ChatOllama
-    except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
-        raise ModuleNotFoundError(error.name) from error
-
-    model = ChatOllama(
+    client = OpenAICompatibleChatClient(
         model=model_name,
         base_url=base_url,
         temperature=0.7,
-        max_retries=2,
+        timeout=30.0,
     )
-    return OllamaOnboardingReasoner(model=model)
+    return OllamaOnboardingReasoner(model=client)
 
 
 def build_story_store() -> StoryStateStore:
@@ -124,16 +253,251 @@ def default_story_db_path() -> Path:
     return Path(__file__).resolve().parents[1] / ".mind_game.sqlite3"
 
 
-def main() -> int:
-    model_name = os.environ.get("OLLAMA_MODEL", "llama3.1")
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+def resolve_base_url() -> str:
+    configured = os.environ.get("MIND_GAME_BASE_URL")
+    if configured:
+        return configured
+    host = os.environ.get("OLLAMA_HOST")
+    if host:
+        return normalize_ollama_host(host)
+    return os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:8080")
 
+
+def normalize_ollama_host(host: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(host if "://" in host else f"http://{host}")
+    netloc = parsed.netloc
+    if ":" not in netloc:
+        netloc = f"{netloc}:11434"
+    return urlunparse((parsed.scheme or "http", netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def normalize_openai_base_url(base_url: str) -> str:
+    cleaned = base_url.rstrip("/")
+    return cleaned if cleaned.endswith("/v1") else f"{cleaned}/v1"
+
+
+def openai_chat_completions_endpoint(base_url: str) -> str:
+    return urljoin(normalize_openai_base_url(base_url).rstrip("/") + "/", "chat/completions")
+
+
+def resolve_model_name(base_url: str) -> str:
+    configured_model = os.environ.get("MIND_GAME_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("OLLAMA_MODEL")
+    if configured_model:
+        return configured_model
+
+    models = fetch_openai_available_models(base_url)
+    if not models:
+        raise RuntimeError(f"No models returned by {openai_models_endpoint(base_url)}")
+    return models[0]
+
+
+def openai_models_endpoint(base_url: str) -> str:
+    return urljoin(normalize_openai_base_url(base_url).rstrip("/") + "/", "models")
+
+
+def fetch_openai_available_models(base_url: str) -> list[str]:
     try:
-        reasoner = build_reasoner(model_name, base_url)
-        onboarding_reasoner = build_onboarding_reasoner(model_name, base_url)
-    except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
-        print(f"Missing dependency: {error}. Install with `python -m pip install -e .`.")
+        logger.info("fetch models start endpoint=%s", openai_models_endpoint(base_url))
+        payload = _get_json(openai_models_endpoint(base_url), timeout=10)
+    except RuntimeError as error:
+        raise RuntimeError(f"Unable to fetch available models from {openai_models_endpoint(base_url)}: {error}") from error
+
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Sequence) or isinstance(data, (str, bytes, bytearray)):
+        return []
+
+    model_ids: list[str] = []
+    for item in data:
+        if not isinstance(item, Mapping):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id:
+            model_ids.append(model_id)
+    logger.info("fetch models done endpoint=%s count=%s", openai_models_endpoint(base_url), len(model_ids))
+    return model_ids
+
+
+def _auth_headers(*, accept: str = "application/json") -> dict[str, str]:
+    headers = {"Accept": accept}
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _json_request(url: str, payload: Mapping[str, Any], *, accept: str = "application/json") -> Request:
+    body = json.dumps(payload).encode("utf-8")
+    headers = _auth_headers(accept=accept)
+    headers["Content-Type"] = "application/json"
+    return Request(url, data=body, headers=headers, method="POST")
+
+
+def _get_json(url: str, *, timeout: float) -> Mapping[str, Any]:
+    request = Request(url, headers=_auth_headers())
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(str(error)) from error
+    if not isinstance(payload, Mapping):
+        return {}
+    return payload
+
+
+def _post_json(url: str, payload: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any]:
+    try:
+        with urlopen(_json_request(url, payload), timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Unable to post chat completion to {url}: {error}") from error
+    if not isinstance(data, Mapping):
+        return {}
+    return data
+
+
+def _response_content_type(response: Any) -> str:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return "text/event-stream"
+    get_content_type = getattr(headers, "get_content_type", None)
+    if callable(get_content_type):
+        return str(get_content_type())
+    return str(headers.get("Content-Type", ""))
+
+
+def _read_json_response(response: Any) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(response.read().decode("utf-8"))
+    except (AttributeError, json.JSONDecodeError) as error:
+        logger.warning("chat stream non-sse response was not json: %s", error)
+        return {}
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _iter_sse_events(response: Any):
+    event_lines: list[str] = []
+    for raw_line in response:
+        text = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
+        for line in text.splitlines():
+            line = line.rstrip("\r\n")
+            if not line:
+                if event_lines:
+                    yield "\n".join(event_lines)
+                    event_lines = []
+                continue
+            if line.startswith("data:"):
+                event_lines.append(line[5:].strip())
+    if event_lines:
+        yield "\n".join(event_lines)
+
+
+def _stream_delta_content(item: Mapping[str, Any]) -> str:
+    choices = item.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return ""
+    delta = first.get("delta")
+    if isinstance(delta, Mapping):
+        return str(delta.get("content") or "")
+    return str(first.get("text") or "")
+
+
+def _response_message_content(item: Mapping[str, Any]) -> str:
+    choices = item.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return ""
+    message = first.get("message")
+    if isinstance(message, Mapping):
+        return str(message.get("content") or "")
+    return str(first.get("text") or "")
+
+
+def _parse_response_usage(item: Any) -> TokenUsage | None:
+    if not isinstance(item, Mapping):
+        return None
+    return (
+        _parse_usage(item.get("usage"))
+        or _parse_usage(item.get("timings"))
+        or _parse_usage(item)
+    )
+
+
+def _parse_usage(value: Any) -> TokenUsage | None:
+    if not isinstance(value, Mapping):
+        return None
+    timings = value.get("timings")
+    if isinstance(timings, Mapping):
+        nested = _parse_usage(timings)
+        if nested is not None:
+            return nested
+    prompt = (
+        _optional_int(value.get("prompt_tokens"))
+        or _optional_int(value.get("prompt_n"))
+        or _optional_int(value.get("tokens_evaluated"))
+    )
+    completion = (
+        _optional_int(value.get("completion_tokens"))
+        or _optional_int(value.get("completion_n"))
+        or _optional_int(value.get("predicted_n"))
+    )
+    total = _optional_int(value.get("total_tokens"))
+    if total is None and prompt is not None and completion is not None:
+        total = prompt + completion
+    generated = (
+        completion
+        or _optional_int(value.get("tokens_predicted"))
+        or _optional_int(value.get("generated_tokens"))
+    )
+    if prompt is None and completion is None and total is None and generated is None:
+        return None
+    return TokenUsage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        generated_tokens=generated,
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _message_payload(message: Any) -> dict[str, str]:
+    if isinstance(message, Mapping):
+        return {
+            "role": str(message.get("role") or "user"),
+            "content": str(message.get("content") or ""),
+        }
+    role = getattr(message, "role", None)
+    if role is None:
+        role = "system" if message.__class__.__name__.lower().startswith("system") else "user"
+    return {"role": str(role), "content": str(getattr(message, "content", ""))}
+
+
+def main() -> int:
+    log_path = configure_logging()
+    base_url = resolve_base_url()
+    logger.info("app main start base_url=%s log_path=%s", base_url, log_path)
+    try:
+        model_name = resolve_model_name(base_url)
+    except RuntimeError as error:
+        logger.exception("model selection failed")
+        print(f"Model selection failed: {error}")
         return 1
+
+    reasoner = build_reasoner(model_name, base_url)
+    onboarding_reasoner = build_onboarding_reasoner(model_name, base_url)
+    logger.info("app model selected model=%s base_url=%s", model_name, base_url)
 
     story_store = build_story_store()
     try:
@@ -153,7 +517,8 @@ def main() -> int:
             MindGameApp(engine=engine, story_store=story_store, model_name=model_name, base_url=base_url).run()
             return 0
 
-        print(f'Mind Game chat loop ready using Ollama model "{model_name}" at {base_url}.')
+        print(f'Mind Game chat loop ready using OpenAI-compatible backend model "{model_name}" at {base_url}.')
+        print(f"Diagnostics log: {log_path}")
         print('Type "exit" to quit.\n')
 
         if story_store is not None and engine.story_session_id is not None:

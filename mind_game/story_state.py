@@ -951,6 +951,28 @@ class StoryStateStore:
             created_at=str(row["created_at"]),
         )
 
+    def update_latest_scene_ascii(self, session_id: int, scene_ascii: str) -> bool:
+        row = self._connection.execute(
+            "SELECT id, state_json FROM state_snapshots WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        state = _json_loads(row["state_json"], {})
+        if not isinstance(state, dict):
+            state = {}
+        state["scene_ascii"] = scene_ascii
+        try:
+            self._connection.execute(
+                "UPDATE state_snapshots SET state_json = ? WHERE id = ?",
+                (_json_dumps(state), int(row["id"])),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return True
+
     def list_events(self, session_id: int, *, limit: int | None = None) -> list[StoryEventRecord]:
         sql = """
             SELECT id, session_id, turn_id, event_type, payload_json, created_at

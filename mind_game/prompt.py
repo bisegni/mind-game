@@ -14,25 +14,30 @@ COMPACT_MEMORY_LAYER = (
 TOOL_CONTEXT_LAYER = (
     "Use the provided tool catalog and tool results to decide the next step, and keep tool arguments small and explicit."
 )
-SCENE_ASCII_LAYER = (
-    "For final narration JSON, include scene_ascii as 10-18 ASCII-only lines representing the current situation; "
-    "make it useful for a terminal map panel with compact spatial layout, landmarks, exits, and the current player "
-    "position when obvious; if scene_viewport is provided, treat its rows and cols as hard layout targets, use all "
-    "available rows and columns, produce a full-canvas map instead of a boxed mini-map, fill the panel with a spatial "
-    "map instead of prose or a small sketch, avoid small centered drawings, spread rooms/zones/corridors/landmarks "
-    "across the full viewport including left, center, right, top, middle, and bottom, avoid legends unless they are "
-    "short and do not reduce map coverage, use @ for player, ? for unknown exit, * for point of interest, =/- for "
-    "corridors, # for walls or structure, and never include a title or scene name line because status already shows "
-    "the scene; "
-    "use no ANSI escapes and keep it sized for a terminal side pane."
-)
-REDRAW_ONLY_LAYER = (
-    "If redraw_only is true in the snapshot, do not advance the story or change facts; "
-    'reply with the "final" JSON, set content to an empty string, and produce scene_ascii '
-    "freshly sized to scene_viewport.cols x scene_viewport.rows that depicts the current scene state."
-)
 PROMPT_ERROR_LAYER = (
     "If required state is missing or contradictory, ask one short clarifying question instead of inventing hidden state."
+)
+
+MAP_SYSTEM_PROMPT = (
+    "You draw an ASCII tile map for the Mind Game viewport. Output ONLY raw ASCII map characters. "
+    "No JSON, no markdown, no code fences, no title, no legend, no preface, no trailing prose, "
+    "no commentary. Begin the response with the first line of the map and stop immediately after "
+    "the final required map row."
+)
+MAP_INSTRUCTIONS_LAYER = (
+    "Draw a tile map of the current scene that depicts what the narration just described. "
+    "Every room or zone MUST have full perimeter walls (top, bottom, AND both sides) drawn with #. "
+    "Place a short label inside each room as [NAME] using up to 6 uppercase letters; never overwrite "
+    "a wall with a label. Connect rooms with corridors: = or - for horizontal, | for vertical, + for "
+    "corners; every room must connect to at least one other room or to a marked exit. "
+    "Use @ for the player (exactly one, inside a room), ? for unknown or unexplored exits, "
+    "* for points of interest, . for floor inside rooms, ~ for water, space for unmapped void "
+    "outside rooms. Distribute rooms across the FULL viewport: use the top, middle, and bottom "
+    "thirds and the left, center, and right thirds; do not cluster all rooms in the upper half. "
+    "Vary room sizes (small 5x4 up to medium 15x8) so the layout is not a single horizontal strip. "
+    "For viewports >= 30x10 draw 3 to 6 labeled rooms with at least 2 connecting corridors; for "
+    "smaller viewports draw 1-2 rooms filling the area. Use no ANSI escapes and no markdown. "
+    "The viewport dimensions are a strict output contract, not a suggestion."
 )
 
 
@@ -44,10 +49,8 @@ def build_system_prompt() -> str:
             "Ask one concise question at a time when you need more information.",
             "Prefer questions about tone, setting, challenge level, and desired player experience.",
             NARRATOR_VOICE_LAYER,
-            SCENE_ASCII_LAYER,
             COMPACT_MEMORY_LAYER,
             TOOL_CONTEXT_LAYER,
-            REDRAW_ONLY_LAYER,
             PROMPT_ERROR_LAYER,
         ]
     )
@@ -63,11 +66,39 @@ def build_turn_prompt(snapshot: Mapping[str, Any], tools: Sequence[Any]) -> str:
         _format_tool_catalog(tools),
         _format_tool_results(snapshot.get("observations", [])),
         TOOL_CONTEXT_LAYER,
-        SCENE_ASCII_LAYER,
-        REDRAW_ONLY_LAYER,
         PROMPT_ERROR_LAYER,
     ]
     return "\n".join(section for section in sections if section)
+
+
+def build_map_prompt(snapshot: Mapping[str, Any], viewport: Mapping[str, int] | None = None) -> str:
+    cols = int((viewport or snapshot.get("scene_viewport") or {}).get("cols") or 60)
+    rows = int((viewport or snapshot.get("scene_viewport") or {}).get("rows") or 16)
+    scene_summary = str(snapshot.get("summary_text") or "").strip()
+    scene_id = str(snapshot.get("current_scene_id") or "").strip()
+    last_player = str(snapshot.get("player_input") or "").strip()
+    facts = snapshot.get("facts") or {}
+    recent_messages = list(snapshot.get("recent_messages") or [])[-4:]
+    context = {
+        "scene_id": scene_id,
+        "summary_text": scene_summary,
+        "facts": facts,
+        "recent_messages": recent_messages,
+        "last_player_input": last_player,
+        "viewport": {"cols": cols, "rows": rows},
+    }
+    return "\n".join(
+        [
+            MAP_INSTRUCTIONS_LAYER,
+            f"Target viewport: EXACTLY {cols} columns by EXACTLY {rows} rows.",
+            f"Output MUST contain exactly {rows} lines.",
+            f"Each output line MUST contain exactly {cols} ASCII characters; pad with spaces if needed.",
+            "Do not output more rows, fewer rows, wider rows, narrower rows, a title, a legend, or any prose.",
+            "Use the full available viewport area while staying inside the exact row and column counts.",
+            f"Scene context: {json.dumps(context, sort_keys=True)}",
+            "Output the map now, raw ASCII only.",
+        ]
+    )
 
 
 def _format_snapshot(snapshot: Mapping[str, Any]) -> str:

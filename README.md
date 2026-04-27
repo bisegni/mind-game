@@ -1,11 +1,11 @@
 # mind-game
 
-First step for an AI-evolving game prototype: a local Python LangChain chat loop powered by Ollama.
+First step for an AI-evolving game prototype: a local Python chat loop powered by an OpenAI-compatible backend.
 
 ## Requirements
 
-- Install Ollama
-- Pull a chat model, for example `ollama pull llama3.1`
+- Install and start `llama-server`, or another OpenAI-compatible backend such as Ollama
+- Load or serve a chat model
 - Install Python dependencies
 
 ## Install
@@ -23,8 +23,11 @@ python -m mind_game.cli
 
 Environment variables:
 
-- `OLLAMA_MODEL` defaults to `llama3.1`
-- `OLLAMA_BASE_URL` defaults to `http://127.0.0.1:11434`
+- `MIND_GAME_BASE_URL` selects the OpenAI-compatible backend; default is `http://127.0.0.1:8080`
+- `OLLAMA_BASE_URL` and `OLLAMA_HOST` remain supported as fallback backend settings
+- `MIND_GAME_MODEL`, `OPENAI_MODEL`, or `OLLAMA_MODEL` selects a model explicitly
+- If no model is set, startup fetches available models from `{MIND_GAME_BASE_URL}/v1/models` and uses the first returned model id
+- `OPENAI_API_KEY` is sent as a bearer token when fetching models or chat completions
 
 ## What it does
 

@@ -1,11 +1,10 @@
 import io
-import sys
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from types import ModuleType
 from unittest.mock import patch
 
 from mind_game.engine import ReActDecision
@@ -56,6 +55,163 @@ class FakeOnboardingReasoner:
 
 
 class CliTests(unittest.TestCase):
+    def test_resolve_base_url_prefers_mind_game_base_url(self) -> None:
+        with patch.dict("os.environ", {"MIND_GAME_BASE_URL": "http://localhost:8080"}, clear=True):
+            self.assertEqual(cli.resolve_base_url(), "http://localhost:8080")
+
+    def test_resolve_base_url_defaults_to_llama_server(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(cli.resolve_base_url(), "http://127.0.0.1:8080")
+
+    def test_resolve_model_name_prefers_configured_ollama_model(self) -> None:
+        with patch.dict("os.environ", {"OLLAMA_MODEL": "configured-model"}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models") as fetch_models:
+                model_name = cli.resolve_model_name("http://example.local:11434")
+
+        self.assertEqual(model_name, "configured-model")
+        fetch_models.assert_not_called()
+
+    def test_resolve_model_name_fetches_first_openai_model_when_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models", return_value=["gpt-4.1-mini", "gpt-4.1"]):
+                model_name = cli.resolve_model_name("https://api.openai.com")
+
+        self.assertEqual(model_name, "gpt-4.1-mini")
+
+    def test_fetch_openai_available_models_reads_model_ids(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b'{"data":[{"id":"gpt-4.1-mini"},{"id":"gpt-4.1"}]}'
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "secret"}, clear=True):
+            with patch.object(cli, "urlopen", return_value=FakeResponse()) as urlopen:
+                models = cli.fetch_openai_available_models("https://api.openai.com")
+
+        self.assertEqual(models, ["gpt-4.1-mini", "gpt-4.1"])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/models")
+        self.assertEqual(request.headers["Authorization"], "Bearer secret")
+
+    def test_openai_base_url_normalizes_optional_v1_suffix(self) -> None:
+        self.assertEqual(cli.openai_models_endpoint("http://localhost:8080"), "http://localhost:8080/v1/models")
+        self.assertEqual(cli.openai_models_endpoint("http://localhost:8080/v1"), "http://localhost:8080/v1/models")
+        self.assertEqual(
+            cli.openai_chat_completions_endpoint("http://localhost:8080"),
+            "http://localhost:8080/v1/chat/completions",
+        )
+
+    def test_openai_client_stream_requests_usage_and_parses_sse(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"ab"}}]}\n\n',
+                        b'data: {"choices":[{"delta":{"content":"c"}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ],
+                )
+
+        client = cli.OpenAICompatibleChatClient(model="served-model", base_url="http://localhost:8080")
+        with patch.object(cli, "urlopen", return_value=FakeResponse()) as urlopen:
+            chunks = list(client.stream([{"role": "user", "content": "draw"}]))
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://localhost:8080/v1/chat/completions")
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual([chunk.content for chunk in chunks], ["ab", "c"])
+        self.assertEqual(chunks[-1].usage.prompt_tokens, 5)
+        self.assertEqual(chunks[-1].usage.completion_tokens, 3)
+        self.assertEqual(chunks[-1].usage.total_tokens, 8)
+
+    def test_openai_client_stream_parses_non_sse_json_response(self) -> None:
+        class FakeHeaders:
+            def get_content_type(self):
+                return "application/json"
+
+        class FakeResponse:
+            headers = FakeHeaders()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"@..\\n###"}}],'
+                    b'"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}'
+                )
+
+        client = cli.OpenAICompatibleChatClient(model="served-model", base_url="http://localhost:8080")
+        with patch.object(cli, "urlopen", return_value=FakeResponse()):
+            chunks = list(client.stream([{"role": "user", "content": "draw"}]))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].content, "@..\n###")
+        self.assertEqual(chunks[0].usage.prompt_tokens, 7)
+        self.assertEqual(chunks[0].usage.completion_tokens, 2)
+        self.assertEqual(chunks[0].usage.total_tokens, 9)
+
+    def test_openai_client_stream_reports_generated_token_count_before_final_usage(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"@"}}]}\n\n',
+                        b'data: {"choices":[{"delta":{"content":"."}}]}\n\n',
+                        b'data: {"choices":[],"timings":{"prompt_n":5,"predicted_n":2}}\n\n',
+                    ],
+                )
+
+        client = cli.OpenAICompatibleChatClient(model="served-model", base_url="http://localhost:8080")
+        with patch.object(cli, "urlopen", return_value=FakeResponse()):
+            chunks = list(client.stream([{"role": "user", "content": "draw"}]))
+
+        self.assertEqual([chunk.content for chunk in chunks[:2]], ["@", "."])
+        self.assertEqual(chunks[0].usage.generated_tokens, 1)
+        self.assertEqual(chunks[1].usage.generated_tokens, 2)
+        self.assertEqual(chunks[-1].usage.prompt_tokens, 5)
+        self.assertEqual(chunks[-1].usage.completion_tokens, 2)
+        self.assertEqual(chunks[-1].usage.total_tokens, 7)
+
+    def test_build_reasoners_use_short_backend_timeout(self) -> None:
+        reasoner = cli.build_reasoner("served-model", "http://localhost:8080")
+        onboarding_reasoner = cli.build_onboarding_reasoner("served-model", "http://localhost:8080")
+
+        self.assertEqual(reasoner.client.timeout, 30.0)
+        self.assertEqual(onboarding_reasoner.model.timeout, 30.0)
+
+    def test_main_returns_error_when_model_discovery_fails(self) -> None:
+        with patch.dict("os.environ", {"OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models", side_effect=RuntimeError("network down")):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    exit_code = cli.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Model selection failed: network down", stdout.getvalue())
+
     def test_main_uses_package_cli_and_engine_loop(self) -> None:
         with patch.dict("os.environ", {"OLLAMA_MODEL": "test-model", "OLLAMA_BASE_URL": "http://example.local:11434"}, clear=True):
             with patch.object(cli, "build_reasoner", return_value=FakeReasoner()) as build_reasoner:
@@ -69,7 +225,10 @@ class CliTests(unittest.TestCase):
         output = stdout.getvalue()
 
         self.assertEqual(exit_code, 0)
-        self.assertIn('Mind Game chat loop ready using Ollama model "test-model" at http://example.local:11434.', output)
+        self.assertIn(
+            'Mind Game chat loop ready using OpenAI-compatible backend model "test-model" at http://example.local:11434.',
+            output,
+        )
         self.assertIn("Player", output)
         self.assertIn("| hello", output)
         self.assertIn("Narrator", output)
@@ -157,7 +316,7 @@ class CliTests(unittest.TestCase):
 
         story_store = FakeStoryStore()
 
-        with patch.dict("os.environ", {"MIND_GAME_STORY_DB_PATH": "/tmp/story.sqlite3"}, clear=True):
+        with patch.dict("os.environ", {"MIND_GAME_STORY_DB_PATH": "/tmp/story.sqlite3", "OLLAMA_MODEL": "test-model"}, clear=True):
             with patch.object(cli, "build_reasoner", return_value=FakeReasoner()):
                 with patch.object(cli, "build_onboarding_reasoner", return_value=FakeOnboardingReasoner()):
                     with patch.object(cli, "build_story_store", return_value=story_store) as build_story_store:
@@ -256,7 +415,7 @@ class CliTests(unittest.TestCase):
             )
 
             buffer = TtyBuffer()
-            with patch.dict("os.environ", {"NO_COLOR": "1"}, clear=True):
+            with patch.dict("os.environ", {"NO_COLOR": "1", "OLLAMA_MODEL": "test-model"}, clear=True):
                 with patch.object(cli.sys, "stdout", buffer):
                     cli._print_session_history(store, session_id)
                     history_output = buffer.getvalue()
@@ -453,38 +612,15 @@ class CliTests(unittest.TestCase):
         }
         tools = [SimpleNamespace(name="session.read", description="Return a compact session snapshot.")]
 
-        messages_module = ModuleType("langchain_core.messages")
-
-        class FakeSystemMessage:
-            def __init__(self, content):
-                self.content = content
-
-        class FakeHumanMessage:
-            def __init__(self, content):
-                self.content = content
-
-        messages_module.SystemMessage = FakeSystemMessage
-        messages_module.HumanMessage = FakeHumanMessage
-
-        langchain_core_module = ModuleType("langchain_core")
-        langchain_core_module.messages = messages_module
-
-        with patch.dict(
-            sys.modules,
-            {
-                "langchain_core": langchain_core_module,
-                "langchain_core.messages": messages_module,
-            },
-        ):
-            with patch.object(cli, "build_turn_prompt", return_value="TURN PROMPT SENTINEL") as build_turn_prompt:
-                decision = reasoner.decide(snapshot, tools)
+        with patch.object(cli, "build_turn_prompt", return_value="TURN PROMPT SENTINEL") as build_turn_prompt:
+            decision = reasoner.decide(snapshot, tools)
 
         self.assertEqual(decision, ReActDecision(kind="final", content="ready"))
         build_turn_prompt.assert_called_once_with(snapshot, tools)
         self.assertEqual(len(model.calls), 1)
-        self.assertEqual(model.calls[0][0].content, "system prompt")
-        self.assertIn("bounded ReAct turn for the Mind Game prototype", model.calls[0][1].content)
-        self.assertIn("TURN PROMPT SENTINEL", model.calls[0][1].content)
+        self.assertEqual(model.calls[0][0]["content"], "system prompt")
+        self.assertIn("bounded ReAct turn for the Mind Game prototype", model.calls[0][1]["content"])
+        self.assertIn("TURN PROMPT SENTINEL", model.calls[0][1]["content"])
 
     def test_reasoner_decide_accepts_final_scene_ascii_payload(self) -> None:
         class PromptRecordingModel:
@@ -495,30 +631,7 @@ class CliTests(unittest.TestCase):
 
         reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
 
-        messages_module = ModuleType("langchain_core.messages")
-
-        class FakeSystemMessage:
-            def __init__(self, content):
-                self.content = content
-
-        class FakeHumanMessage:
-            def __init__(self, content):
-                self.content = content
-
-        messages_module.SystemMessage = FakeSystemMessage
-        messages_module.HumanMessage = FakeHumanMessage
-
-        langchain_core_module = ModuleType("langchain_core")
-        langchain_core_module.messages = messages_module
-
-        with patch.dict(
-            sys.modules,
-            {
-                "langchain_core": langchain_core_module,
-                "langchain_core.messages": messages_module,
-            },
-        ):
-            decision = reasoner.decide({"player_input": "open"}, [])
+        decision = reasoner.decide({"player_input": "open"}, [])
 
         self.assertEqual(decision.kind, "final")
         self.assertEqual(decision.content, "The hatch opens.")
@@ -552,30 +665,7 @@ class CliTests(unittest.TestCase):
             "seed_scene": {},
         }
 
-        messages_module = ModuleType("langchain_core.messages")
-
-        class FakeSystemMessage:
-            def __init__(self, content):
-                self.content = content
-
-        class FakeHumanMessage:
-            def __init__(self, content):
-                self.content = content
-
-        messages_module.SystemMessage = FakeSystemMessage
-        messages_module.HumanMessage = FakeHumanMessage
-
-        langchain_core_module = ModuleType("langchain_core")
-        langchain_core_module.messages = messages_module
-
-        with patch.dict(
-            sys.modules,
-            {
-                "langchain_core": langchain_core_module,
-                "langchain_core.messages": messages_module,
-            },
-        ):
-            decision = reasoner.decide(snapshot)
+        decision = reasoner.decide(snapshot)
 
         self.assertEqual(decision.kind, "question")
         self.assertNotIn("{", decision.content)

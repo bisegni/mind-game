@@ -7,6 +7,7 @@ from mind_game.prompt import (
     NARRATOR_VOICE_LAYER,
     PROMPT_ERROR_LAYER,
     TOOL_CONTEXT_LAYER,
+    build_map_prompt,
     build_system_prompt,
     build_turn_prompt,
     is_exit_command,
@@ -23,9 +24,6 @@ class PromptTests(unittest.TestCase):
         self.assertIn(COMPACT_MEMORY_LAYER, prompt)
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
-        self.assertIn("10-18 ASCII-only lines", prompt)
-        self.assertIn("terminal map panel", prompt)
-        self.assertIn("landmarks, exits", prompt)
         self.assertIn("one concise question at a time", prompt)
         self.assertIn("tone, setting, challenge level", prompt)
 
@@ -76,23 +74,6 @@ class PromptTests(unittest.TestCase):
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
         self.assertIn("redraw_only", prompt)
-        self.assertIn("scene_viewport.cols x scene_viewport.rows", prompt)
-        self.assertIn("compact spatial layout", prompt)
-        self.assertIn("current player position", prompt)
-        self.assertIn("hard layout targets", prompt)
-        self.assertIn("use all available rows and columns", prompt)
-        self.assertIn("full-canvas map", prompt)
-        self.assertIn("boxed mini-map", prompt)
-        self.assertIn("fill the panel with a spatial map", prompt)
-        self.assertIn("avoid small centered drawings", prompt)
-        self.assertIn("left, center, right, top, middle, and bottom", prompt)
-        self.assertIn("avoid legends unless they are short", prompt)
-        self.assertIn("@ for player", prompt)
-        self.assertIn("? for unknown exit", prompt)
-        self.assertIn("* for point of interest", prompt)
-        self.assertIn("=/- for corridors", prompt)
-        self.assertIn("# for walls or structure", prompt)
-        self.assertIn("never include a title or scene name line", prompt)
         self.assertIn('"current_scene_id": "scene:harbor"', prompt)
         self.assertIn('"scene_viewport": {"cols": 80, "rows": 18}', prompt)
         self.assertIn('"summary_text": "A beacon cuts through the fog."', prompt)
@@ -101,6 +82,30 @@ class PromptTests(unittest.TestCase):
         self.assertIn('Tool catalog: [{"description": "Return a compact session snapshot.", "name": "session.read"}', prompt)
         self.assertIn('Tool results: [{"result": "{\\"turn\\": 7}", "tool": "session.read"}]', prompt)
         self.assertIn("do not rely on or restate", prompt)
+
+    def test_build_map_prompt_lists_map_rules(self) -> None:
+        snapshot = {
+            "current_scene_id": "scene:harbor",
+            "summary_text": "A foggy harbor.",
+            "facts": {"tone": "tense"},
+            "recent_messages": [],
+            "player_input": "look around",
+        }
+        viewport = {"cols": 60, "rows": 16}
+
+        prompt = build_map_prompt(snapshot, viewport)
+
+        self.assertIn("full perimeter walls", prompt)
+        self.assertIn("[NAME]", prompt)
+        self.assertIn("Distribute rooms across the FULL viewport", prompt)
+        self.assertIn("@ for the player", prompt)
+        self.assertIn("? for unknown", prompt)
+        self.assertIn("* for points of interest", prompt)
+        self.assertIn("3 to 6 labeled rooms", prompt)
+        self.assertIn("Target viewport: EXACTLY 60 columns by EXACTLY 16 rows", prompt)
+        self.assertIn("Output MUST contain exactly 16 lines", prompt)
+        self.assertIn("Each output line MUST contain exactly 60 ASCII characters", prompt)
+        self.assertIn("Do not output more rows, fewer rows, wider rows, narrower rows", prompt)
 
     def test_build_turn_prompt_includes_compact_onboarding_seed_data(self) -> None:
         snapshot = {

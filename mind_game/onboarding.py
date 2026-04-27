@@ -394,13 +394,11 @@ class OllamaOnboardingReasoner:
         return OnboardingDecision(kind="question", content=question)
 
     def next_question(self, snapshot: Mapping[str, Any], *, missing_field: str, attempt_count: int = 0) -> str:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
         prompt = build_onboarding_question_prompt(snapshot, missing_field=missing_field, attempt_count=attempt_count)
         response = self.model.invoke(
             [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=prompt),
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
             ],
         )
         content = response.content if isinstance(response.content, str) else str(response.content)
@@ -411,13 +409,11 @@ class OllamaOnboardingReasoner:
         return _coerce_message_text(content, required_field_prompt(missing_field, attempt_count=attempt_count))
 
     def extract_updates(self, snapshot: Mapping[str, Any], *, answer_text: str, asked_field: str) -> dict[str, Any]:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
         prompt = build_onboarding_extraction_prompt(snapshot, asked_field=asked_field, answer_text=answer_text)
         response = self.model.invoke(
             [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=prompt),
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
             ],
         )
         content = response.content if isinstance(response.content, str) else str(response.content)

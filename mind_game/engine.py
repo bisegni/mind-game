@@ -29,12 +29,27 @@ class ReActDecision:
     content: str = ""
     scene_ascii: str = ""
     tool: ToolCall | None = None
+    usage: "TokenUsage | None" = None
 
 
 @dataclass(slots=True)
 class ToolObservation:
     tool: str
     result: str
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    generated_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamChunk:
+    content: str = ""
+    usage: TokenUsage | None = None
 
 
 @dataclass(slots=True)
@@ -81,6 +96,7 @@ class EngineTurn:
     reply: str
     observations: list[ToolObservation]
     scene_ascii: str = ""
+    usage: TokenUsage | None = None
 
 
 class BaseReActEngine:
@@ -173,12 +189,52 @@ class BaseReActEngine:
                     consequences=[observation.result for observation in observations if observation.result],
                     scene_ascii=scene_ascii,
                 )
-            return EngineTurn(player_input=text, reply=reply, observations=observations, scene_ascii=scene_ascii)
+            return EngineTurn(
+                player_input=text,
+                reply=reply,
+                observations=observations,
+                scene_ascii=scene_ascii,
+                usage=decision.usage,
+            )
 
         raise RuntimeError("ReAct loop exceeded the configured step limit")
 
+    def stream_map(
+        self,
+        *,
+        viewport: Mapping[str, int],
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> str:
+        """Stream a fresh scene ASCII from the reasoner, calling on_chunk with growing buffer."""
+        self.scene_viewport_size = dict(viewport)
+        context = ToolContext(session=self.session, player_input="")
+        snapshot = self._snapshot(context, [])
+        snapshot["redraw_only"] = True
+        snapshot["player_input"] = ""
+        if not hasattr(self._reasoner, "stream_map"):
+            return ""
+        accumulated = ""
+        for raw_chunk in self._reasoner.stream_map(snapshot, viewport):
+            chunk = _coerce_stream_chunk(raw_chunk)
+            accumulated += chunk.content
+            if on_chunk is not None:
+                if chunk.usage is None:
+                    on_chunk(accumulated)
+                else:
+                    on_chunk(StreamChunk(content=accumulated, usage=chunk.usage))
+        final = accumulated.strip()
+        if final and self._story_store is not None and self._story_session_id is not None:
+            self._story_store.update_latest_scene_ascii(self._story_session_id, final)
+        return final
+
     def redraw_scene(self, *, viewport: Mapping[str, int]) -> str:
-        """Ask the reasoner for a fresh scene_ascii sized to the new viewport."""
+        """Ask the reasoner for a fresh scene_ascii sized to the new viewport.
+
+        Routes through stream_map when the reasoner supports streaming.
+        Falls back to a single decide() call otherwise.
+        """
+        if hasattr(self._reasoner, "stream_map"):
+            return self.stream_map(viewport=viewport)
         self.scene_viewport_size = dict(viewport)
         context = ToolContext(session=self.session, player_input="")
         snapshot = self._snapshot(context, [])
@@ -317,3 +373,14 @@ class DeterministicSubagentRunner:
     def run(self, task: SubagentTask) -> str:
         preview = json.dumps(task.context, sort_keys=True)
         return f"{task.role} handled {task.task} with {preview[:120]}"
+
+
+def _coerce_stream_chunk(value: Any) -> StreamChunk:
+    if isinstance(value, StreamChunk):
+        return value
+    usage = getattr(value, "usage", None)
+    content = getattr(value, "content", value)
+    return StreamChunk(
+        content=content if isinstance(content, str) else str(content or ""),
+        usage=usage if isinstance(usage, TokenUsage) else None,
+    )
