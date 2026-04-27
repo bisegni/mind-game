@@ -3,6 +3,7 @@ from __future__ import annotations
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import Input, RichLog, Static
 
@@ -14,9 +15,9 @@ from .story_state import StoryStateStore
 
 
 RESIZE_REDRAW_DEBOUNCE_SECONDS = 1.0
-MAP_STREAM_REQUEST_TIMEOUT_SECONDS = 35.0
+MAP_STREAM_REQUEST_TIMEOUT_SECONDS = 12.0
 LLM_VIEWPORT_MAX_COLS = 120
-LLM_VIEWPORT_MAX_ROWS = 40
+LLM_VIEWPORT_MAX_ROWS = 18
 LLM_VIEWPORT_MAX_RATIO = 2
 LLM_VIEWPORT_MIN_COLS = 24
 LLM_VIEWPORT_MIN_ROWS = 8
@@ -35,7 +36,7 @@ class MindGameApp(App[None]):
 
     #status {
         width: 1fr;
-        height: 8;
+        height: 7;
         border: solid $accent;
         padding: 0 1;
         text-wrap: nowrap;
@@ -51,9 +52,17 @@ class MindGameApp(App[None]):
         overflow: hidden;
     }
 
+    #scene_description {
+        width: 1fr;
+        height: 3;
+        border: solid $secondary;
+        padding: 0 1;
+        overflow: hidden;
+    }
+
     #chat_stack {
         height: 40%;
-        min-height: 8;
+        min-height: 6;
     }
 
     #chat {
@@ -106,6 +115,7 @@ class MindGameApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Static(id="status")
         yield Static(id="situation")
+        yield Static(id="scene_description")
         with Vertical(id="chat_stack"):
             yield RichLog(id="chat", wrap=True, markup=False, auto_scroll=True)
             yield Input(placeholder="Player >", id="player_input")
@@ -220,6 +230,7 @@ class MindGameApp(App[None]):
     def _refresh_dashboard(self) -> None:
         self.query_one("#status", Static).update(self._status_text())
         self.query_one("#situation", Static).update(self._situation_text())
+        self.query_one("#scene_description", Static).update(self._scene_description_text())
 
     def _tick_spinner(self) -> None:
         if not self.is_waiting_for_model and not self.is_streaming_map:
@@ -272,7 +283,7 @@ class MindGameApp(App[None]):
         cols, rows = self._widget_viewport_size()
         art = self.current_scene_ascii.strip() or self._placeholder_scene()
         return _styled_map_text(
-            render_scene_map(art, cols=cols, rows=max(3, rows - 2)),
+            render_scene_map(art, cols=cols, rows=max(1, rows - 2)),
         )
 
     def _widget_viewport_size(self) -> tuple[int, int]:
@@ -318,6 +329,23 @@ class MindGameApp(App[None]):
             return ""
         return str(snapshot.state.get("scene_ascii") or "")
 
+    def _latest_scene_description(self) -> str:
+        if self.story_store is None or self.engine.story_session_id is None:
+            return ""
+        snapshot = self.story_store.latest_snapshot(self.engine.story_session_id)
+        if snapshot is None:
+            return ""
+        return str(snapshot.state.get("scene_description") or "").strip()
+
+    def _scene_description_text(self) -> Text:
+        description = self._latest_scene_description() or "No stored scene description yet."
+        width = max(12, self.query_one("#scene_description", Static).size.width)
+        value_width = max(1, width - len("desc: "))
+        text = Text()
+        text.append("SCENE DESCRIPTION\n", style="bold bright_magenta")
+        _append_status_field(text, "desc", description, value_width=value_width, value_style="bright_black", newline=False)
+        return text
+
     def _placeholder_scene(self) -> str:
         summary = ""
         if self.story_store is not None and self.engine.story_session_id is not None:
@@ -357,7 +385,7 @@ class MindGameApp(App[None]):
         try:
             logger.info("map stream start viewport=%s", viewport)
             self.call_from_thread(self._set_map_requesting_status, viewport)
-            self.engine.stream_map(
+            final_ascii = self.engine.stream_map(
                 viewport=viewport,
                 on_chunk=lambda buf: self.call_from_thread(self._apply_partial_scene, buf),
             )
@@ -366,7 +394,7 @@ class MindGameApp(App[None]):
             self.call_from_thread(self._finish_map_error, error)
             return
         logger.info("map stream done viewport=%s", viewport)
-        self.call_from_thread(self._finish_map_stream)
+        self.call_from_thread(self._finish_map_stream, final_ascii)
 
     def _set_map_requesting_status(self, viewport: dict[str, int]) -> None:
         if not self.is_streaming_map:
@@ -381,19 +409,31 @@ class MindGameApp(App[None]):
     def _apply_partial_scene(self, buf: str | StreamChunk) -> None:
         usage = buf.usage if isinstance(buf, StreamChunk) else None
         content = buf.content if isinstance(buf, StreamChunk) else buf
+        if self._map_stream_viewport is None and self.status_mode == "error":
+            logger.info("ignored stale map chunk after error")
+            return
         self._clear_map_timeout()
         if usage is not None:
             self._map_stream_usage = usage
-        self.current_scene_ascii = _clip_scene_ascii_for_viewport(content, self._map_stream_viewport)
-        self._map_stream_line_count = len(self.current_scene_ascii.splitlines())
+        if content:
+            self.current_scene_ascii = _clip_scene_ascii_for_viewport(content, self._map_stream_viewport)
+            self._map_stream_line_count = len(self.current_scene_ascii.splitlines())
         if self._map_stream_viewport is not None:
             _, rows = self._map_stream_viewport
             self.status_mode = "map"
             self.status_message = self._map_status_message(rows)
-        self._refresh_dashboard()
+        try:
+            self._refresh_dashboard()
+        except NoMatches:
+            logger.info("ignored late map chunk after ui teardown")
 
-    def _finish_map_stream(self) -> None:
+    def _finish_map_stream(self, final_ascii: str = "") -> None:
+        if not self.is_streaming_map and self._map_stream_viewport is None:
+            logger.info("ignored stale map finish")
+            return
         self._clear_map_timeout()
+        if final_ascii:
+            self.current_scene_ascii = _clip_scene_ascii_for_viewport(final_ascii, self._map_stream_viewport)
         self.is_streaming_map = False
         self._map_stream_viewport = None
         self._map_stream_line_count = 0
@@ -404,12 +444,19 @@ class MindGameApp(App[None]):
         if not self.is_waiting_for_model:
             self.status_mode = "idle"
             self.status_message = "ready"
-        self._last_redraw_size = self._llm_viewport_size()
-        self._refresh_dashboard()
+        try:
+            self._last_redraw_size = self._llm_viewport_size()
+            self._refresh_dashboard()
+        except NoMatches:
+            logger.info("ignored late map finish after ui teardown")
+            return
         if pending_viewport is not None:
             self._start_map_stream(pending_viewport)
 
     def _finish_map_error(self, error: Exception) -> None:
+        if not self.is_streaming_map and self._map_stream_viewport is None:
+            logger.info("ignored stale map error: %s", error)
+            return
         self._clear_map_timeout()
         self.is_streaming_map = False
         self._map_stream_viewport = None
@@ -420,7 +467,10 @@ class MindGameApp(App[None]):
         self.status_mode = "error"
         self.status_message = f"map failed: {error}"
         logger.warning("map stream error surfaced: %s", error)
-        self._refresh_dashboard()
+        try:
+            self._refresh_dashboard()
+        except NoMatches:
+            logger.info("ignored late map error after ui teardown")
 
     def _stop_map_stream_status(self) -> None:
         self._clear_map_timeout()
@@ -535,15 +585,20 @@ class MindGameApp(App[None]):
 def render_scene_map(art: str, *, cols: int = 68, rows: int = 16) -> str:
     """Frame the LLM-supplied scene art to fit the viewport, padding empty cells with floor tiles."""
     inner_width = max(8, cols - 2)
-    target_rows = max(3, rows)
+    target_rows = max(1, rows)
     border = "+" + "=" * inner_width + "+"
-    body_capacity = max(1, target_rows - 2)
+    if target_rows == 1:
+        return border
+    if target_rows == 2:
+        return "\n".join([border, border])
+
+    body_capacity = target_rows - 2
 
     raw_lines = art.splitlines() or [""]
 
     body: list[str] = []
     for line in raw_lines[:body_capacity]:
-        clipped = line[:inner_width]
+        clipped = _clear_wall_fill_line(line[:inner_width], inner_width)
         padded = clipped + "." * (inner_width - len(clipped))
         body.append("|" + padded + "|")
     while len(body) < body_capacity:
@@ -559,6 +614,20 @@ def _clip_scene_ascii_for_viewport(art: str, viewport: tuple[int, int] | None) -
     if cols <= 0 or rows <= 0:
         return art
     return "\n".join(line[:cols] for line in art.splitlines()[:rows])
+
+
+def _clear_wall_fill_line(line: str, width: int) -> str:
+    if width < 8:
+        return line
+    stripped = line.strip()
+    if stripped and set(stripped) == {"#"} and len(stripped) >= max(8, int(width * 0.75)):
+        return ""
+    non_floor = [char for char in line if char != "."]
+    wall_count = sum(1 for char in non_floor if char == "#")
+    useful_count = sum(1 for char in line if char in "@*?~[]ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    if width >= 16 and wall_count >= max(8, int(width * 0.35)) and useful_count == 0:
+        return ""
+    return line
 
 
 def _format_token_usage(usage: TokenUsage) -> str:

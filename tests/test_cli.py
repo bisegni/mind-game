@@ -137,6 +137,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(chunks[-1].usage.completion_tokens, 3)
         self.assertEqual(chunks[-1].usage.total_tokens, 8)
 
+    def test_openai_client_stream_merges_extra_payload(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def __iter__(self):
+                return iter([b"data: [DONE]\n\n"])
+
+        client = cli.OpenAICompatibleChatClient(model="served-model", base_url="http://localhost:8080")
+        with patch.object(cli, "urlopen", return_value=FakeResponse()) as urlopen:
+            list(
+                client.stream(
+                    [{"role": "user", "content": "draw"}],
+                    extra_payload={
+                        "temperature": 0.2,
+                        "max_tokens": 512,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                ),
+            )
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["temperature"], 0.2)
+        self.assertEqual(payload["max_tokens"], 512)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+
     def test_openai_client_stream_parses_non_sse_json_response(self) -> None:
         class FakeHeaders:
             def get_content_type(self):
@@ -194,6 +224,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(chunks[-1].usage.prompt_tokens, 5)
         self.assertEqual(chunks[-1].usage.completion_tokens, 2)
         self.assertEqual(chunks[-1].usage.total_tokens, 7)
+
+    def test_openai_client_stream_treats_reasoning_deltas_as_progress(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n',
+                        b'data: {"choices":[{"delta":{"thinking":"more"}}]}\n\n',
+                        b'data: {"choices":[{"delta":{"content":"@."}}]}\n\n',
+                        b"data: [DONE]\n\n",
+                    ],
+                )
+
+        client = cli.OpenAICompatibleChatClient(model="served-model", base_url="http://localhost:8080")
+        with patch.object(cli, "urlopen", return_value=FakeResponse()):
+            chunks = list(client.stream([{"role": "user", "content": "draw"}]))
+
+        self.assertEqual([chunk.content for chunk in chunks], ["", "", "@."])
+        self.assertEqual([chunk.usage.generated_tokens for chunk in chunks], [1, 2, 3])
+
+    def test_map_stream_payload_disables_thinking_and_caps_tokens_to_viewport(self) -> None:
+        payload = cli._map_stream_payload({"cols": 24, "rows": 8})
+
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(payload["temperature"], 0.2)
+        self.assertEqual(payload["max_tokens"], max(128, (24 + 1) * 8 + 64))
+
+    def test_map_stream_payload_caps_large_viewports_to_fast_budget(self) -> None:
+        payload = cli._map_stream_payload({"cols": 80, "rows": 30})
+
+        self.assertEqual(payload["max_tokens"], 1024)
 
     def test_build_reasoners_use_short_backend_timeout(self) -> None:
         reasoner = cli.build_reasoner("served-model", "http://localhost:8080")
@@ -615,7 +682,7 @@ class CliTests(unittest.TestCase):
         with patch.object(cli, "build_turn_prompt", return_value="TURN PROMPT SENTINEL") as build_turn_prompt:
             decision = reasoner.decide(snapshot, tools)
 
-        self.assertEqual(decision, ReActDecision(kind="final", content="ready"))
+        self.assertEqual(decision, ReActDecision(kind="final", content="ready", scene_description="ready"))
         build_turn_prompt.assert_called_once_with(snapshot, tools)
         self.assertEqual(len(model.calls), 1)
         self.assertEqual(model.calls[0][0]["content"], "system prompt")
@@ -626,7 +693,7 @@ class CliTests(unittest.TestCase):
         class PromptRecordingModel:
             def invoke(self, messages):
                 return SimpleNamespace(
-                    content='{"kind":"final","content":"The hatch opens.","scene_ascii":"+---+\\n| * |\\n+---+"}',
+                    content='{"kind":"final","content":"The hatch opens.","scene_description":"Player is inside a chamber with a hatch south.","scene_ascii":"+---+\\n| * |\\n+---+"}',
                 )
 
         reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
@@ -635,7 +702,34 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(decision.kind, "final")
         self.assertEqual(decision.content, "The hatch opens.")
+        self.assertEqual(decision.scene_description, "Player is inside a chamber with a hatch south.")
         self.assertIn("| * |", decision.scene_ascii)
+
+    def test_reasoner_decide_uses_plain_text_as_scene_description(self) -> None:
+        class PromptRecordingModel:
+            def invoke(self, messages):
+                return SimpleNamespace(content="You stand beside a humming console.")
+
+        reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
+
+        decision = reasoner.decide({"player_input": "look"}, [])
+
+        self.assertEqual(decision.kind, "final")
+        self.assertEqual(decision.content, "You stand beside a humming console.")
+        self.assertEqual(decision.scene_description, "You stand beside a humming console.")
+
+    def test_reasoner_decide_uses_content_as_scene_description_when_missing(self) -> None:
+        class PromptRecordingModel:
+            def invoke(self, messages):
+                return SimpleNamespace(content='{"kind":"final","content":"You stand in a chamber."}')
+
+        reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
+
+        decision = reasoner.decide({"player_input": "look"}, [])
+
+        self.assertEqual(decision.kind, "final")
+        self.assertEqual(decision.content, "You stand in a chamber.")
+        self.assertEqual(decision.scene_description, "You stand in a chamber.")
 
     def test_onboarding_reasoner_returns_plain_text_when_model_emits_structured_content(self) -> None:
         class PromptRecordingModel:

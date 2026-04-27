@@ -39,6 +39,32 @@ def _as_list(value: Any) -> list[Any]:
     return list(value)
 
 
+def _text_or_empty(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _session_record_from_row(row: sqlite3.Row | Mapping[str, Any]) -> "StorySessionRecord":
+    data = dict(row)
+    return StorySessionRecord(
+        id=_int_or_default(data.get("id")),
+        created_at=_text_or_empty(data.get("created_at")),
+        updated_at=_text_or_empty(data.get("updated_at")),
+        status=_text_or_empty(data.get("status")) or "active",
+        seed_scene_id=data.get("seed_scene_id"),
+        current_turn=_int_or_default(data.get("current_turn")),
+        current_scene_id=data.get("current_scene_id"),
+        current_summary_id=data.get("current_summary_id"),
+        onboarding_id=data.get("onboarding_id"),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StorySessionRecord:
     id: int
@@ -358,18 +384,7 @@ class StoryStateStore:
         ).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        return StorySessionRecord(
-            id=int(data["id"]),
-            created_at=str(data["created_at"]),
-            updated_at=str(data["updated_at"]),
-            status=str(data["status"]),
-            seed_scene_id=data["seed_scene_id"],
-            current_turn=int(data["current_turn"]),
-            current_scene_id=data["current_scene_id"],
-            current_summary_id=data["current_summary_id"],
-            onboarding_id=data["onboarding_id"],
-        )
+        return _session_record_from_row(row)
 
     def latest_session(self, *, status: str | None = None) -> StorySessionRecord | None:
         sql = """
@@ -385,18 +400,7 @@ class StoryStateStore:
         row = self._connection.execute(sql, params).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        return StorySessionRecord(
-            id=int(data["id"]),
-            created_at=str(data["created_at"]),
-            updated_at=str(data["updated_at"]),
-            status=str(data["status"]),
-            seed_scene_id=data["seed_scene_id"],
-            current_turn=int(data["current_turn"]),
-            current_scene_id=data["current_scene_id"],
-            current_summary_id=data["current_summary_id"],
-            onboarding_id=data["onboarding_id"],
-        )
+        return _session_record_from_row(row)
 
     def list_sessions(
         self,
@@ -419,20 +423,7 @@ class StoryStateStore:
             sql += " LIMIT ?"
             params.append(limit)
         rows = self._connection.execute(sql, params).fetchall()
-        return [
-            StorySessionRecord(
-                id=int(row["id"]),
-                created_at=str(row["created_at"]),
-                updated_at=str(row["updated_at"]),
-                status=str(row["status"]),
-                seed_scene_id=row["seed_scene_id"],
-                current_turn=int(row["current_turn"]),
-                current_scene_id=row["current_scene_id"],
-                current_summary_id=row["current_summary_id"],
-                onboarding_id=row["onboarding_id"],
-            )
-            for row in rows
-        ]
+        return [_session_record_from_row(row) for row in rows]
 
     def latest_playable_session(self) -> StorySessionRecord | None:
         row = self._connection.execute(
@@ -448,18 +439,7 @@ class StoryStateStore:
         ).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        return StorySessionRecord(
-            id=int(data["id"]),
-            created_at=str(data["created_at"]),
-            updated_at=str(data["updated_at"]),
-            status=str(data["status"]),
-            seed_scene_id=data["seed_scene_id"],
-            current_turn=int(data["current_turn"]),
-            current_scene_id=data["current_scene_id"],
-            current_summary_id=data["current_summary_id"],
-            onboarding_id=data["onboarding_id"],
-        )
+        return _session_record_from_row(row)
 
     def create_onboarding_session(
         self,
@@ -1242,6 +1222,7 @@ class StoryStateStore:
         if snapshot is None and onboarding_seed:
             snapshot_state = {
                 "summary_text": onboarding_seed.get("summary_text", ""),
+                "scene_description": onboarding_seed.get("scene_description", ""),
                 "scene_ascii": onboarding_seed.get("scene_ascii", ""),
                 "facts": dict(onboarding_seed.get("facts", {})),
                 "notes": list(onboarding_seed.get("story_promises", [])),
@@ -1251,6 +1232,7 @@ class StoryStateStore:
         facts = dict(snapshot_state.get("facts", {}))
         notes = list(snapshot_state.get("notes", []))
         summary_text = str(snapshot_state.get("summary_text", ""))
+        scene_description = str(snapshot_state.get("scene_description", ""))
         scene_ascii = str(snapshot_state.get("scene_ascii", ""))
         current_scene_id = session.current_scene_id if session.current_scene_id is not None else None
         if current_scene_id is None and snapshot is not None:
@@ -1273,6 +1255,7 @@ class StoryStateStore:
             "current_scene_id": current_scene_id,
             "current_summary_id": session.current_summary_id,
             "summary_text": snapshot.summary_text if snapshot is not None else summary_text,
+            "scene_description": scene_description,
             "scene_ascii": scene_ascii,
             "facts": facts,
             "notes": notes,
@@ -1300,6 +1283,7 @@ class StoryStateStore:
         consequences: Sequence[str] | None = None,
         observations: Sequence[Mapping[str, Any]] | Sequence[Any] = (),
         scene_id: str | None = None,
+        scene_description: str = "",
         scene_ascii: str = "",
     ) -> StoryTurnRecord:
         now = _now()
@@ -1459,6 +1443,7 @@ class StoryStateStore:
                 facts=facts,
                 notes=notes,
                 scene_id=resolved_scene_id,
+                scene_description=scene_description,
                 scene_ascii=scene_ascii,
                 focus_entity_ids=focus_entity_ids,
                 observations=observations,
@@ -1519,6 +1504,7 @@ class StoryStateStore:
         facts: Mapping[str, str] | None,
         notes: Sequence[str] | None,
         scene_id: str | None,
+        scene_description: str,
         focus_entity_ids: Sequence[int],
         observations: Sequence[Mapping[str, Any]] | Sequence[Any],
         scene_ascii: str,
@@ -1539,6 +1525,7 @@ class StoryStateStore:
             "recent_messages": recent_messages,
             "observations": self._normalize_observations(observations),
             "summary_text": self._summarize(narrator_output),
+            "scene_description": str(scene_description or narrator_output or ""),
             "scene_ascii": str(scene_ascii or prompt_state.get("scene_ascii") or ""),
             "graph_focus": {
                 "entity_ids": list(dict.fromkeys(int(entity_id) for entity_id in focus_entity_ids)),

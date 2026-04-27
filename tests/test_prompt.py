@@ -6,6 +6,7 @@ from mind_game.prompt import (
     GAME_LOOP_LAYER,
     NARRATOR_VOICE_LAYER,
     PROMPT_ERROR_LAYER,
+    SCENE_DESCRIPTION_LAYER,
     TOOL_CONTEXT_LAYER,
     build_map_prompt,
     build_system_prompt,
@@ -21,6 +22,7 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn(GAME_LOOP_LAYER, prompt)
         self.assertIn(NARRATOR_VOICE_LAYER, prompt)
+        self.assertIn(SCENE_DESCRIPTION_LAYER, prompt)
         self.assertIn(COMPACT_MEMORY_LAYER, prompt)
         self.assertIn(TOOL_CONTEXT_LAYER, prompt)
         self.assertIn(PROMPT_ERROR_LAYER, prompt)
@@ -34,6 +36,7 @@ class PromptTests(unittest.TestCase):
             "current_scene_id": "scene:harbor",
             "current_summary_id": 42,
             "summary_text": "A beacon cuts through the fog.",
+            "scene_description": "Player stands on a foggy harbor dock. Beacon is north. Water is east.",
             "scene_viewport": {"cols": 80, "rows": 18},
             "facts": {"tone": "playful"},
             "recent_messages": [
@@ -64,6 +67,7 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn(GAME_LOOP_LAYER, prompt)
         self.assertIn(NARRATOR_VOICE_LAYER, prompt)
+        self.assertIn(SCENE_DESCRIPTION_LAYER, prompt)
         self.assertIn(COMPACT_MEMORY_LAYER, prompt)
         self.assertIn("current_scene_id", prompt)
         self.assertIn("summary_text", prompt)
@@ -77,6 +81,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"current_scene_id": "scene:harbor"', prompt)
         self.assertIn('"scene_viewport": {"cols": 80, "rows": 18}', prompt)
         self.assertIn('"summary_text": "A beacon cuts through the fog."', prompt)
+        self.assertIn('"scene_description": "Player stands on a foggy harbor dock. Beacon is north. Water is east."', prompt)
         self.assertIn('"facts": {"tone": "playful"}', prompt)
         self.assertIn('"recent_messages": [{"content": "hello", "role": "player"}', prompt)
         self.assertIn('Tool catalog: [{"description": "Return a compact session snapshot.", "name": "session.read"}', prompt)
@@ -86,23 +91,29 @@ class PromptTests(unittest.TestCase):
     def test_build_map_prompt_lists_map_rules(self) -> None:
         snapshot = {
             "current_scene_id": "scene:harbor",
+            "scene_description": "Player stands in a small alien chamber. Corridor exits south. Control panel west, humming device east, flickering console north.",
             "summary_text": "A foggy harbor.",
             "facts": {"tone": "tense"},
-            "recent_messages": [],
+            "recent_messages": [
+                {"role": "assistant", "content": "The chamber hums around you."},
+            ],
             "player_input": "look around",
         }
         viewport = {"cols": 60, "rows": 16}
 
         prompt = build_map_prompt(snapshot, viewport)
 
-        self.assertIn("full perimeter walls", prompt)
+        self.assertIn("Never use # as background", prompt)
+        self.assertIn("leave unused viewport cells blank", prompt)
         self.assertIn("[NAME]", prompt)
-        self.assertIn("Distribute rooms across the FULL viewport", prompt)
         self.assertIn("@ for the player", prompt)
         self.assertIn("? for unknown", prompt)
         self.assertIn("* for points of interest", prompt)
         self.assertIn("3 to 6 labeled rooms", prompt)
         self.assertIn("Target viewport: EXACTLY 60 columns by EXACTLY 16 rows", prompt)
+        self.assertIn("Map source priority: scene_description first", prompt)
+        self.assertIn('"scene_description": "Player stands in a small alien chamber.', prompt)
+        self.assertIn('"latest_narrator_message": "The chamber hums around you."', prompt)
         self.assertIn("Output MUST contain exactly 16 lines", prompt)
         self.assertIn("Each output line MUST contain exactly 60 ASCII characters", prompt)
         self.assertIn("Do not output more rows, fewer rows, wider rows, narrower rows", prompt)

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mind_game.story_state import StoryEdgeDraft, StoryEntityDraft, StoryStateStore
+from mind_game.story_state import StoryEdgeDraft, StoryEntityDraft, StoryStateStore, _session_record_from_row
 
 
 class StoryStateStoreTests(unittest.TestCase):
@@ -49,6 +49,26 @@ class StoryStateStoreTests(unittest.TestCase):
                 "idx_onboarding_answers_session_index",
             }.issubset(indexes),
         )
+
+    def test_load_session_tolerates_legacy_nullable_session_fields(self) -> None:
+        session = _session_record_from_row(
+            {
+                "id": 99,
+                "created_at": "",
+                "updated_at": None,
+                "status": None,
+                "seed_scene_id": None,
+                "current_turn": None,
+                "current_scene_id": None,
+                "current_summary_id": None,
+                "onboarding_id": None,
+            },
+        )
+
+        self.assertEqual(session.current_turn, 0)
+        self.assertEqual(session.status, "active")
+        self.assertEqual(session.created_at, "")
+        self.assertEqual(session.updated_at, "")
 
     def test_insert_load_and_file_path_round_trip_story_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -320,6 +340,65 @@ class StoryStateStoreTests(unittest.TestCase):
         self.assertEqual(snapshot.state["scene_ascii"], "+LAB+\n|@..|\n+---+")
         # Other state keys must survive the patch.
         self.assertEqual(snapshot.state["facts"]["power"], "on")
+
+    def test_record_turn_stores_scene_description_in_prompt_state(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:chamber")
+        prompt_state = store.build_prompt_state(session_id, player_input="enter", observations=[])
+
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="enter",
+            narrator_output="You step into the chamber.",
+            prompt_state=prompt_state,
+            scene_id="scene:chamber",
+            scene_description=(
+                "Player stands in a small alien chamber. Corridor exits south. "
+                "Control panel west, humming device east, console north."
+            ),
+        )
+
+        snapshot = store.latest_snapshot(session_id)
+        next_prompt_state = store.build_prompt_state(session_id, player_input="continue", observations=[])
+
+        self.assertEqual(
+            snapshot.state["scene_description"],
+            "Player stands in a small alien chamber. Corridor exits south. Control panel west, humming device east, console north.",
+        )
+        self.assertEqual(
+            next_prompt_state["scene_description"],
+            "Player stands in a small alien chamber. Corridor exits south. Control panel west, humming device east, console north.",
+        )
+
+    def test_record_turn_replaces_prior_scene_description_with_narrator_fallback(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:chamber")
+        first_prompt_state = store.build_prompt_state(session_id, player_input="enter", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="enter",
+            narrator_output="You enter a chamber.",
+            prompt_state=first_prompt_state,
+            scene_id="scene:chamber",
+            scene_description="Old chamber description.",
+        )
+        second_prompt_state = store.build_prompt_state(session_id, player_input="look", observations=[])
+
+        store.record_turn(
+            session_id,
+            turn_number=1,
+            player_input="look",
+            narrator_output="You stand beside a newly opened hatch.",
+            prompt_state=second_prompt_state,
+            scene_id="scene:chamber",
+            scene_description="",
+        )
+
+        snapshot = store.latest_snapshot(session_id)
+
+        self.assertEqual(snapshot.state["scene_description"], "You stand beside a newly opened hatch.")
 
     def test_update_latest_scene_ascii_returns_false_when_no_snapshot(self) -> None:
         store = StoryStateStore()

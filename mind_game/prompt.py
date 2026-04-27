@@ -8,6 +8,11 @@ GAME_LOOP_LAYER = "You are the Mind Game story loop."
 NARRATOR_VOICE_LAYER = (
     "When you narrate, stay in character, keep the voice concise, and avoid internal implementation details."
 )
+SCENE_DESCRIPTION_LAYER = (
+    "For every final answer, include scene_description as compact spatial context for map creation: "
+    "current location, player position, exits, nearby rooms or zones, landmarks, obstacles, "
+    "interactive objects, and unexplored directions."
+)
 COMPACT_MEMORY_LAYER = (
     "Use the compact session summary and recent messages as memory; do not rely on or restate the full transcript."
 )
@@ -26,14 +31,17 @@ MAP_SYSTEM_PROMPT = (
 )
 MAP_INSTRUCTIONS_LAYER = (
     "Draw a tile map of the current scene that depicts what the narration just described. "
-    "Every room or zone MUST have full perimeter walls (top, bottom, AND both sides) drawn with #. "
+    "Draw # only for actual room or zone walls described by the scene. Never use # as background, "
+    "padding, filler, or an end-of-map curtain. Empty or unknown outside space must be spaces. "
+    "Rooms or zones should have clear perimeter walls (top, bottom, and sides) drawn with # when "
+    "there is enough space. "
     "Place a short label inside each room as [NAME] using up to 6 uppercase letters; never overwrite "
     "a wall with a label. Connect rooms with corridors: = or - for horizontal, | for vertical, + for "
     "corners; every room must connect to at least one other room or to a marked exit. "
     "Use @ for the player (exactly one, inside a room), ? for unknown or unexplored exits, "
     "* for points of interest, . for floor inside rooms, ~ for water, space for unmapped void "
-    "outside rooms. Distribute rooms across the FULL viewport: use the top, middle, and bottom "
-    "thirds and the left, center, and right thirds; do not cluster all rooms in the upper half. "
+    "outside rooms. Spread described rooms across the viewport when the scene contains multiple "
+    "spaces, but leave unused viewport cells blank instead of filling them with walls. "
     "Vary room sizes (small 5x4 up to medium 15x8) so the layout is not a single horizontal strip. "
     "For viewports >= 30x10 draw 3 to 6 labeled rooms with at least 2 connecting corridors; for "
     "smaller viewports draw 1-2 rooms filling the area. Use no ANSI escapes and no markdown. "
@@ -49,6 +57,7 @@ def build_system_prompt() -> str:
             "Ask one concise question at a time when you need more information.",
             "Prefer questions about tone, setting, challenge level, and desired player experience.",
             NARRATOR_VOICE_LAYER,
+            SCENE_DESCRIPTION_LAYER,
             COMPACT_MEMORY_LAYER,
             TOOL_CONTEXT_LAYER,
             PROMPT_ERROR_LAYER,
@@ -60,6 +69,7 @@ def build_turn_prompt(snapshot: Mapping[str, Any], tools: Sequence[Any]) -> str:
     sections = [
         GAME_LOOP_LAYER,
         NARRATOR_VOICE_LAYER,
+        SCENE_DESCRIPTION_LAYER,
         COMPACT_MEMORY_LAYER,
         _format_snapshot(snapshot),
         _format_story_graph(snapshot),
@@ -75,12 +85,16 @@ def build_map_prompt(snapshot: Mapping[str, Any], viewport: Mapping[str, int] | 
     cols = int((viewport or snapshot.get("scene_viewport") or {}).get("cols") or 60)
     rows = int((viewport or snapshot.get("scene_viewport") or {}).get("rows") or 16)
     scene_summary = str(snapshot.get("summary_text") or "").strip()
+    scene_description = str(snapshot.get("scene_description") or "").strip()
     scene_id = str(snapshot.get("current_scene_id") or "").strip()
     last_player = str(snapshot.get("player_input") or "").strip()
     facts = snapshot.get("facts") or {}
     recent_messages = list(snapshot.get("recent_messages") or [])[-4:]
+    latest_narrator = _latest_message_content(recent_messages, "assistant")
     context = {
         "scene_id": scene_id,
+        "scene_description": scene_description,
+        "latest_narrator_message": latest_narrator,
         "summary_text": scene_summary,
         "facts": facts,
         "recent_messages": recent_messages,
@@ -95,6 +109,7 @@ def build_map_prompt(snapshot: Mapping[str, Any], viewport: Mapping[str, int] | 
             f"Each output line MUST contain exactly {cols} ASCII characters; pad with spaces if needed.",
             "Do not output more rows, fewer rows, wider rows, narrower rows, a title, a legend, or any prose.",
             "Use the full available viewport area while staying inside the exact row and column counts.",
+            "Map source priority: scene_description first, then latest_narrator_message, then summary_text and facts.",
             f"Scene context: {json.dumps(context, sort_keys=True)}",
             "Output the map now, raw ASCII only.",
         ]
@@ -108,6 +123,7 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
         "current_scene_id": snapshot.get("current_scene_id"),
         "current_summary_id": snapshot.get("current_summary_id"),
         "summary_text": snapshot.get("summary_text", ""),
+        "scene_description": snapshot.get("scene_description", ""),
         "scene_ascii": snapshot.get("scene_ascii", ""),
         "scene_viewport": snapshot.get("scene_viewport", {}),
         "redraw_only": bool(snapshot.get("redraw_only", False)),
@@ -122,6 +138,7 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
             "session_id": onboarding_seed.get("session_id"),
             "scene_id": onboarding_seed.get("scene_id"),
             "summary_text": onboarding_seed.get("summary_text", ""),
+            "scene_description": onboarding_seed.get("scene_description", ""),
             "facts": onboarding_seed.get("facts", {}),
             "world_tags": onboarding_seed.get("world_tags", []),
             "story_promises": onboarding_seed.get("story_promises", []),
@@ -170,6 +187,15 @@ def _read_value(item: Any, key: str) -> str:
     if isinstance(item, Mapping):
         return str(item.get(key, ""))
     return str(getattr(item, key, ""))
+
+
+def _latest_message_content(messages: Sequence[Any], role: str) -> str:
+    for message in reversed(list(messages)):
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "") == role:
+            return str(message.get("content") or "").strip()
+    return ""
 
 
 def normalize_user_input(value: str) -> str:

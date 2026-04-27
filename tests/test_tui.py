@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mind_game.engine import EngineTurn, StreamChunk, TokenUsage
+from mind_game.story_state import StoryStateStore
 
 try:
     from textual.app import App as TextualApp
+    from textual.css.query import NoMatches
     from textual.widgets import Input, RichLog, Static
 
     from mind_game.tui import (
@@ -19,6 +21,7 @@ try:
         render_scene_map,
     )
 except ModuleNotFoundError:  # pragma: no cover - depends on optional local install
+    NoMatches = None
     TextualApp = None
     Input = RichLog = Static = None
     MindGameApp = None
@@ -132,6 +135,47 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("MAP / SITUATION", rendered)
             self.assertIn("/\\", rendered)
             self.assertIn("||", rendered)
+
+    async def test_latest_scene_description_is_shown_for_debugging(self) -> None:
+        store = StoryStateStore()
+        session_id = store.create_session(current_scene_id="scene:chamber")
+        prompt_state = store.build_prompt_state(session_id, player_input="enter", observations=[])
+        store.record_turn(
+            session_id,
+            turn_number=0,
+            player_input="enter",
+            narrator_output="You step into the chamber.",
+            prompt_state=prompt_state,
+            scene_id="scene:chamber",
+            scene_description="Player stands in a chamber. Console north. Device east. Corridor south.",
+            scene_ascii="@..",
+        )
+
+        class IdleEngine:
+            story_session_id = session_id
+            session = SimpleNamespace(turn=1)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=store,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test(size=(100, 40)):
+            rendered = str(app.query_one("#scene_description", Static).render())
+
+            self.assertIn("SCENE DESCRIPTION", rendered)
+            self.assertIn("Console north", rendered)
             self.assertLessEqual(rendered.count("\n") + 1, app.query_one("#situation", Static).size.height)
             self.assertNotIn("Map /", rendered)
 
@@ -178,6 +222,20 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("row-0-", rendered_lines[1])
         self.assertIn("row-4-", rendered_lines[5])
         self.assertNotIn("row-5-", rendered)
+
+    def test_render_scene_map_clears_persisted_wall_fill_rows(self) -> None:
+        rendered = render_scene_map("@.......\n########\n########", cols=10, rows=5)
+        rendered_lines = rendered.splitlines()
+
+        self.assertEqual(rendered_lines[2], "|" + "." * 8 + "|")
+        self.assertEqual(rendered_lines[3], "|" + "." * 8 + "|")
+
+    def test_render_scene_map_clears_repeated_wall_spam_rows(self) -> None:
+        rendered = render_scene_map("@...................\n######.#####.#####.\n######.#####.#####.", cols=22, rows=5)
+        rendered_lines = rendered.splitlines()
+
+        self.assertEqual(rendered_lines[2], "|" + "." * 20 + "|")
+        self.assertEqual(rendered_lines[3], "|" + "." * 20 + "|")
 
     async def test_resize_schedules_engine_redraw_with_new_viewport(self) -> None:
         class RedrawEngine:
@@ -360,6 +418,41 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.2)
             self.assertIn("nt: ready", str(app.query_one("#status", Static).render()))
 
+    async def test_map_stream_finish_applies_final_returned_ascii(self) -> None:
+        map_started = threading.Event()
+
+        class FinalFallbackEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                map_started.set()
+                if on_chunk is not None:
+                    on_chunk("........................\n........................")
+                return "..........*CON..........\n.*PAN......@......*DEV.\n............?..........."
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=FinalFallbackEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test(size=(80, 30)) as pilot:
+            app._start_map_stream({"cols": 24, "rows": 4})
+            await self._wait_for_event(map_started)
+            await pilot.pause(0.2)
+
+            self.assertIn("*CON", app.current_scene_ascii)
+            self.assertIn("*PAN", app.current_scene_ascii)
+            self.assertIn("*DEV", app.current_scene_ascii)
+
     async def test_partial_map_stream_is_clipped_to_requested_viewport(self) -> None:
         class IdleEngine:
             story_session_id = None
@@ -421,6 +514,130 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
 
             rendered_status = str(app.query_one("#status", Static).render())
             self.assertIn("map: streaming 2/4 tok 38/242", rendered_status)
+
+    async def test_reasoning_only_map_progress_updates_status_without_clearing_map(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.is_streaming_map = True
+            app._map_stream_viewport = (12, 4)
+            app.current_scene_ascii = "@...\n####"
+            app._map_stream_line_count = 2
+            app._reset_map_timeout()
+
+            app._apply_partial_scene(StreamChunk(content="", usage=TokenUsage(generated_tokens=3)))
+
+            self.assertEqual(app.current_scene_ascii, "@...\n####")
+            rendered_status = str(app.query_one("#status", Static).render())
+            self.assertIn("map: streaming 2/4 tok 3", rendered_status)
+
+    async def test_stale_map_finish_after_timeout_does_not_clear_error_status(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app._finish_map_error(TimeoutError("timed out"))
+            app._finish_map_stream()
+
+            self.assertIn("map failed: timed out", str(app.query_one("#status", Static).render()))
+
+    async def test_late_partial_map_chunk_after_teardown_is_ignored(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.is_streaming_map = True
+            app._map_stream_viewport = (12, 4)
+            app._refresh_dashboard = Mock(side_effect=NoMatches("missing"))
+
+            app._apply_partial_scene(StreamChunk(content="@...", usage=TokenUsage(generated_tokens=1)))
+
+            self.assertEqual(app.current_scene_ascii, "@...")
+            self.assertEqual(app.status_mode, "map")
+
+    async def test_stale_map_error_after_shutdown_is_ignored(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.status_mode = "idle"
+            app.status_message = "ready"
+            app.is_streaming_map = False
+            app._map_stream_viewport = None
+
+            app._finish_map_error(NoMatches("missing"))
+
+            self.assertEqual(app.status_mode, "idle")
+            self.assertEqual(app.status_message, "ready")
 
     async def test_map_status_stays_queued_until_worker_enters_backend_call(self) -> None:
         class IdleEngine:

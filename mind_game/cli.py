@@ -70,8 +70,8 @@ class OpenAICompatibleChatClient:
                     content = str(first.get("text") or "")
         return ChatResponse(content=content, usage=_parse_usage(response.get("usage") if isinstance(response, Mapping) else None))
 
-    def stream(self, messages: Sequence[Any]):
-        payload = self._payload(messages, stream=True)
+    def stream(self, messages: Sequence[Any], *, extra_payload: Mapping[str, Any] | None = None):
+        payload = self._payload(messages, stream=True, extra_payload=extra_payload)
         endpoint = openai_chat_completions_endpoint(self.base_url)
         request = _json_request(endpoint, payload, accept="text/event-stream")
         logger.info("chat stream start endpoint=%s model=%s", endpoint, self.model)
@@ -110,34 +110,46 @@ class OpenAICompatibleChatClient:
                         logger.warning("chat stream malformed event endpoint=%s event_prefix=%r", endpoint, event[:120])
                         continue
                     content = _stream_delta_content(item)
+                    reasoning = _stream_delta_reasoning_content(item)
                     usage = _parse_response_usage(item)
-                    if content or usage is not None:
-                        if content and usage is None:
+                    if content or reasoning or usage is not None:
+                        if (content or reasoning) and usage is None:
                             generated_chunks += 1
                             usage = TokenUsage(generated_tokens=generated_chunks)
                         elif usage is not None and usage.generated_tokens is not None:
                             generated_chunks = usage.generated_tokens
                         chunk_count += 1
-                        logger.debug(
-                            "chat stream chunk endpoint=%s chunk=%s chars=%s usage=%s",
-                            endpoint,
-                            chunk_count,
-                            len(content),
-                            usage,
-                        )
+                        if chunk_count <= 5 or chunk_count % 50 == 0 or (
+                            usage is not None and usage.total_tokens is not None
+                        ):
+                            logger.debug(
+                                "chat stream chunk endpoint=%s chunk=%s chars=%s usage=%s",
+                                endpoint,
+                                chunk_count,
+                                len(content),
+                                usage,
+                            )
                         yield StreamChunk(content=content, usage=usage)
                 logger.info("chat stream finished endpoint=%s chunks=%s", endpoint, chunk_count)
         except (OSError, URLError) as error:
             logger.exception("chat stream failed endpoint=%s", endpoint)
             raise RuntimeError(f"Unable to stream chat completion from {endpoint}: {error}") from error
 
-    def _payload(self, messages: Sequence[Any], *, stream: bool) -> dict[str, Any]:
+    def _payload(
+        self,
+        messages: Sequence[Any],
+        *,
+        stream: bool,
+        extra_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [_message_payload(message) for message in messages],
             "temperature": self.temperature,
             "stream": stream,
         }
+        if extra_payload is not None:
+            payload.update(dict(extra_payload))
         if stream:
             payload["stream_options"] = {"include_usage": True}
         return payload
@@ -178,6 +190,7 @@ class OpenAICompatibleReActReasoner:
                 {"role": "system", "content": MAP_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
+            extra_payload=_map_stream_payload(viewport),
         ):
             yield chunk
 
@@ -186,7 +199,7 @@ class OpenAICompatibleReActReasoner:
             [
                 "You are running a bounded ReAct turn for the Mind Game prototype.",
                 "Choose exactly one action per response.",
-                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"...","scene_ascii":"..."}.',
+                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"...","scene_description":"...","scene_ascii":"..."}.',
                 "Use tools when you need session state or bounded delegation.",
                 "Keep tool arguments small and explicit.",
                 build_turn_prompt(snapshot, tools),
@@ -196,12 +209,12 @@ class OpenAICompatibleReActReasoner:
     def _parse_decision(self, content: str) -> ReActDecision:
         text = content.strip()
         if not text.startswith("{"):
-            return ReActDecision(kind="final", content=text)
+            return ReActDecision(kind="final", content=text, scene_description=text)
 
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            return ReActDecision(kind="final", content=text)
+            return ReActDecision(kind="final", content=text, scene_description=text)
 
         kind = str(payload.get("kind") or payload.get("type") or "final").lower()
         if kind == "tool":
@@ -215,11 +228,22 @@ class OpenAICompatibleReActReasoner:
             )
 
         content_text = str(payload.get("content") or payload.get("final") or text).strip()
+        scene_description = str(payload.get("scene_description") or content_text).strip()
         scene_ascii = str(payload.get("scene_ascii") or "").strip()
-        return ReActDecision(kind="final", content=content_text, scene_ascii=scene_ascii)
+        return ReActDecision(kind="final", content=content_text, scene_description=scene_description, scene_ascii=scene_ascii)
 
 
 OllamaReActReasoner = OpenAICompatibleReActReasoner
+
+
+def _map_stream_payload(viewport: Mapping[str, int] | None) -> dict[str, Any]:
+    cols = _positive_int(viewport.get("cols") if viewport is not None else None) or 24
+    rows = _positive_int(viewport.get("rows") if viewport is not None else None) or 8
+    return {
+        "temperature": 0.2,
+        "max_tokens": min(1024, max(128, (cols + 1) * rows + 64)),
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def build_reasoner(model_name: str, base_url: str) -> OpenAICompatibleReActReasoner:
@@ -406,6 +430,23 @@ def _stream_delta_content(item: Mapping[str, Any]) -> str:
     return str(first.get("text") or "")
 
 
+def _stream_delta_reasoning_content(item: Mapping[str, Any]) -> str:
+    choices = item.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return ""
+    delta = first.get("delta")
+    if not isinstance(delta, Mapping):
+        return ""
+    for key in ("reasoning_content", "reasoning", "thinking", "thoughts"):
+        value = delta.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _response_message_content(item: Mapping[str, Any]) -> str:
     choices = item.get("choices")
     if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)) or not choices:
@@ -470,6 +511,13 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive_int(value: Any) -> int | None:
+    number = _optional_int(value)
+    if number is None or number <= 0:
+        return None
+    return number
 
 
 def _message_payload(message: Any) -> dict[str, str]:

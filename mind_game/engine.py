@@ -4,8 +4,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
+from .diagnostics import get_logger
 from .story_state import StoryStateStore
 
+
+logger = get_logger(__name__)
+MAP_CONTEXT_LOG_LIMIT = 500
+MAP_STREAM_GENERATED_TOKEN_BUDGET_FACTOR = 3
 
 Role = Literal["player", "assistant", "tool"]
 DecisionKind = Literal["tool", "final"]
@@ -27,6 +32,7 @@ class ToolCall:
 class ReActDecision:
     kind: DecisionKind
     content: str = ""
+    scene_description: str = ""
     scene_ascii: str = ""
     tool: ToolCall | None = None
     usage: "TokenUsage | None" = None
@@ -95,6 +101,7 @@ class EngineTurn:
     player_input: str
     reply: str
     observations: list[ToolObservation]
+    scene_description: str = ""
     scene_ascii: str = ""
     usage: TokenUsage | None = None
 
@@ -168,12 +175,22 @@ class BaseReActEngine:
                 if decision.tool is None:
                     raise ValueError("tool decisions must include a tool call")
 
-                result = self._dispatch_tool(context, decision.tool)
+                try:
+                    result = self._dispatch_tool(context, decision.tool)
+                except (KeyError, ValueError) as error:
+                    result = f"tool_error: {error}"
                 observations.append(ToolObservation(tool=decision.tool.name, result=result))
                 continue
 
             reply = decision.content.strip()
+            scene_description = decision.scene_description.strip() or reply
+            scene_description_source = "model" if decision.scene_description.strip() else "narration_fallback"
             scene_ascii = decision.scene_ascii.strip()
+            logger.info(
+                "story scene_description source=%s chars=%s",
+                scene_description_source,
+                len(scene_description),
+            )
             self.session.transcript.append(GameMessage(role="assistant", content=reply))
             self.session.turn += 1
             if self._story_store is not None and self._story_session_id is not None:
@@ -187,12 +204,14 @@ class BaseReActEngine:
                     notes=list(self.session.notes),
                     observations=observations,
                     consequences=[observation.result for observation in observations if observation.result],
+                    scene_description=scene_description,
                     scene_ascii=scene_ascii,
                 )
             return EngineTurn(
                 player_input=text,
                 reply=reply,
                 observations=observations,
+                scene_description=scene_description,
                 scene_ascii=scene_ascii,
                 usage=decision.usage,
             )
@@ -213,16 +232,29 @@ class BaseReActEngine:
         snapshot["player_input"] = ""
         if not hasattr(self._reasoner, "stream_map"):
             return ""
+        _log_map_context(snapshot, viewport)
         accumulated = ""
+        viewport_size = _viewport_size(viewport)
+        raw_budget = _streamed_map_budget(viewport_size)
         for raw_chunk in self._reasoner.stream_map(snapshot, viewport):
             chunk = _coerce_stream_chunk(raw_chunk)
             accumulated += chunk.content
+            visible = _normalize_streamed_map_for_viewport(accumulated, viewport_size, final=False)
             if on_chunk is not None:
                 if chunk.usage is None:
-                    on_chunk(accumulated)
+                    on_chunk(visible)
                 else:
-                    on_chunk(StreamChunk(content=accumulated, usage=chunk.usage))
-        final = accumulated.strip()
+                    on_chunk(StreamChunk(content=visible, usage=chunk.usage))
+            if (
+                _streamed_map_is_complete(accumulated, viewport_size)
+                or len(accumulated) >= raw_budget
+                or _streamed_map_usage_exhausted(chunk.usage, viewport_size)
+            ):
+                break
+        final = _normalize_streamed_map_for_viewport(accumulated, viewport_size, final=True).rstrip("\n")
+        if _has_raw_wall_spam(accumulated, viewport_size) or _is_degenerate_map(final, viewport_size):
+            logger.warning("map stream produced degenerate output; using fallback map")
+            final = _fallback_scene_map(snapshot, viewport_size)
         if final and self._story_store is not None and self._story_session_id is not None:
             self._story_store.update_latest_scene_ascii(self._story_session_id, final)
         return final
@@ -329,6 +361,7 @@ class BaseReActEngine:
             "notes": payload.get("notes", list(self.session.notes[-3:])),
             "player_input": payload.get("player_input", context.player_input),
             "summary_text": payload.get("summary_text", ""),
+            "scene_description": payload.get("scene_description", ""),
             "graph_focus": payload.get("graph_focus", {}),
         }
         return json.dumps(payload, sort_keys=True)
@@ -384,3 +417,168 @@ def _coerce_stream_chunk(value: Any) -> StreamChunk:
         content=content if isinstance(content, str) else str(content or ""),
         usage=usage if isinstance(usage, TokenUsage) else None,
     )
+
+
+def _log_map_context(snapshot: Mapping[str, Any], viewport: Mapping[str, int]) -> None:
+    viewport_size = _viewport_size(viewport)
+    viewport_text = f"{viewport_size[0]}x{viewport_size[1]}" if viewport_size is not None else str(dict(viewport))
+    scene_description = str(snapshot.get("scene_description") or "").strip()
+    summary_text = str(snapshot.get("summary_text") or "")
+    recent_messages = snapshot.get("recent_messages")
+    recent_count = len(recent_messages) if isinstance(recent_messages, Sequence) and not isinstance(recent_messages, (str, bytes, bytearray)) else 0
+    logger.info(
+        'map context viewport=%s scene_description_present=%s scene_description="%s" summary_chars=%s recent_messages=%s',
+        viewport_text,
+        bool(scene_description),
+        _one_line_log_text(scene_description, limit=MAP_CONTEXT_LOG_LIMIT),
+        len(summary_text),
+        recent_count,
+    )
+
+
+def _one_line_log_text(value: str, *, limit: int) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _viewport_size(viewport: Mapping[str, int]) -> tuple[int, int] | None:
+    try:
+        cols = int(viewport.get("cols") or 0)
+        rows = int(viewport.get("rows") or 0)
+    except (TypeError, ValueError):
+        return None
+    if cols <= 0 or rows <= 0:
+        return None
+    return cols, rows
+
+
+def _normalize_streamed_map_for_viewport(text: str, viewport: tuple[int, int] | None, *, final: bool) -> str:
+    if viewport is None:
+        return text
+    cols, rows = viewport
+    raw_lines = text.splitlines()[:rows]
+    if final:
+        visible_lines = raw_lines + [""] * max(0, rows - len(raw_lines))
+    else:
+        visible_lines = raw_lines
+    return "\n".join(_normalize_map_line(line, cols) for line in visible_lines)
+
+
+def _streamed_map_is_complete(text: str, viewport: tuple[int, int] | None) -> bool:
+    if viewport is None:
+        return False
+    _, rows = viewport
+    lines = text.splitlines()
+    return len(lines) >= rows
+
+
+def _streamed_map_budget(viewport: tuple[int, int] | None) -> int:
+    if viewport is None:
+        return 4096
+    cols, rows = viewport
+    return max(cols * rows * 2, 1024)
+
+
+def _streamed_map_usage_exhausted(usage: TokenUsage | None, viewport: tuple[int, int] | None) -> bool:
+    if usage is None or usage.generated_tokens is None or viewport is None:
+        return False
+    cols, rows = viewport
+    return usage.generated_tokens >= max(128, (cols + 1) * rows * MAP_STREAM_GENERATED_TOKEN_BUDGET_FACTOR)
+
+
+def _normalize_map_line(line: str, cols: int) -> str:
+    clipped = line[:cols]
+    if _is_wall_fill_line(clipped, cols) or _is_wall_spam_line(clipped, cols):
+        clipped = ""
+    return clipped + "." * (cols - len(clipped))
+
+
+def _is_wall_fill_line(line: str, cols: int) -> bool:
+    if cols < 8:
+        return False
+    stripped = line.strip()
+    if not stripped or set(stripped) != {"#"}:
+        return False
+    return len(stripped) >= max(8, int(cols * 0.75))
+
+
+def _is_wall_spam_line(line: str, cols: int) -> bool:
+    if cols < 16:
+        return False
+    non_floor = [char for char in line if char != "."]
+    if not non_floor:
+        return False
+    wall_count = sum(1 for char in non_floor if char == "#")
+    if wall_count < max(8, int(cols * 0.35)):
+        return False
+    useful_count = sum(1 for char in line if char in "@*?~[]ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    return useful_count == 0
+
+
+def _is_degenerate_map(art: str, viewport: tuple[int, int] | None) -> bool:
+    lines = art.splitlines()
+    if not lines:
+        return True
+    text = "\n".join(lines)
+    if viewport is None:
+        cols = max(len(line) for line in lines)
+    else:
+        cols, _ = viewport
+    wall_spam_rows = sum(1 for line in lines if _is_wall_spam_line(line, cols) or _is_wall_fill_line(line, cols))
+    if wall_spam_rows >= max(2, len(lines) // 3):
+        return True
+    wall_chars = sum(line.count("#") for line in lines)
+    total_chars = sum(len(line) for line in lines)
+    useful_chars = sum(1 for char in text if char in "@*?~[]ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    return total_chars > 0 and wall_chars / total_chars > 0.45 and useful_chars == 0
+
+
+def _has_raw_wall_spam(text: str, viewport: tuple[int, int] | None) -> bool:
+    lines = text.splitlines()
+    if not lines:
+        return False
+    cols = viewport[0] if viewport is not None else max(len(line) for line in lines)
+    if cols < 16:
+        return False
+    wall_spam_rows = sum(1 for line in lines if _is_wall_spam_line(line[:cols], cols) or _is_wall_fill_line(line[:cols], cols))
+    return wall_spam_rows >= max(2, len(lines) // 3)
+
+
+def _fallback_scene_map(snapshot: Mapping[str, Any], viewport: tuple[int, int] | None) -> str:
+    cols, rows = viewport or (40, 12)
+    cols = max(8, cols)
+    rows = max(4, rows)
+    grid = [["." for _ in range(cols)] for _ in range(rows)]
+    center_x = cols // 2
+    center_y = rows // 2
+    _put_text(grid, center_x, center_y, "@")
+
+    description = str(snapshot.get("scene_description") or snapshot.get("summary_text") or "").lower()
+    if "console" in description:
+        _put_text(grid, center_x - 2, max(0, center_y - 3), "*CON")
+    if "panel" in description:
+        _put_text(grid, 1, center_y, "*PAN")
+    if "device" in description:
+        _put_text(grid, max(0, cols - 5), center_y, "*DEV")
+    if "corridor" in description or "exit" in description or "behind" in description:
+        exit_y = min(rows - 1, center_y + 3)
+        if exit_y <= center_y + 2 and rows > center_y + 1:
+            exit_y = rows - 1
+        _put_text(grid, center_x, exit_y, "?")
+        for y in range(center_y + 1, max(center_y + 1, exit_y)):
+            grid[y][center_x] = "|"
+    return "\n".join("".join(row) for row in grid)
+
+
+def _put_text(grid: list[list[str]], x: int, y: int, text: str) -> None:
+    if y < 0 or y >= len(grid):
+        return
+    width = len(grid[y])
+    for index, char in enumerate(text):
+        column = x + index
+        if 0 <= column < width:
+            grid[y][column] = char
