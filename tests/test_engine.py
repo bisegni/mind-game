@@ -8,6 +8,7 @@ from mind_game.engine import (
     SubagentTask,
     TokenUsage,
     ToolCall,
+    _strip_thinking_tags,
 )
 from mind_game.story_state import StoryEdgeDraft, StoryEntityDraft, StoryStateStore
 
@@ -513,3 +514,90 @@ class EngineTests(unittest.TestCase):
         result = engine.stream_map(viewport={"cols": 40, "rows": 8})
 
         self.assertEqual(result, "")
+
+    def test_stream_map_strips_thinking_tokens_before_processing(self) -> None:
+        """Thinking-model output: <think>…</think> preamble then actual map.
+        The final and on_chunk callbacks must contain only the map rows."""
+        map_rows = "+--+\n|@.|\n+--+"
+
+        class ThinkingReasoner(ScriptedReasoner):
+            def stream_map(self, snapshot, viewport):
+                # Emit thinking block first, then real map content — as separate chunks
+                # to exercise both the per-chunk strip and the final strip.
+                yield "<think>\nLet me reason about the map layout.\n</think>\n"
+                yield map_rows
+
+        reasoner = ThinkingReasoner([])
+        engine = BaseReActEngine(reasoner)
+
+        received: list[str] = []
+        final = engine.stream_map(viewport={"cols": 4, "rows": 3}, on_chunk=received.append)
+
+        # Final must contain map content, not thinking prose.
+        self.assertIn("@", final)
+        self.assertNotIn("<think>", final)
+        self.assertNotIn("reason", final)
+
+        # No on_chunk callback should carry thinking content.
+        for chunk in received:
+            self.assertNotIn("<think>", chunk)
+            self.assertNotIn("reason", chunk)
+
+    def test_stream_map_strips_unclosed_thinking_tag(self) -> None:
+        """Stream cut off mid-think (timeout / token budget): still no thinking in output."""
+
+        class PartialThinkReasoner(ScriptedReasoner):
+            def stream_map(self, snapshot, viewport):
+                yield "<think>\nStill thinking..."
+                # No closing </think> — stream ends here
+
+        reasoner = PartialThinkReasoner([])
+        engine = BaseReActEngine(reasoner)
+
+        received: list[str] = []
+        engine.stream_map(viewport={"cols": 10, "rows": 4}, on_chunk=received.append)
+
+        for chunk in received:
+            self.assertNotIn("<think>", chunk)
+            self.assertNotIn("thinking", chunk)
+
+
+class StripThinkingTagsTests(unittest.TestCase):
+    def test_removes_complete_think_block(self) -> None:
+        text = "<think>some reasoning here</think>\n#####\n|@..|\n#####"
+        result = _strip_thinking_tags(text)
+        self.assertNotIn("<think>", result)
+        self.assertNotIn("reasoning", result)
+        self.assertIn("#####", result)
+        self.assertIn("@", result)
+
+    def test_removes_multiline_think_block(self) -> None:
+        text = "<think>\nline 1\nline 2\n</think>\n+--+\n|@.|\n+--+"
+        result = _strip_thinking_tags(text)
+        self.assertNotIn("line 1", result)
+        self.assertIn("+--+", result)
+
+    def test_strips_unclosed_think_to_end_of_string(self) -> None:
+        text = "+--+\n<think>\nnot yet closed"
+        result = _strip_thinking_tags(text)
+        self.assertIn("+--+", result)
+        self.assertNotIn("not yet closed", result)
+        self.assertNotIn("<think>", result)
+
+    def test_passthrough_when_no_think_tags(self) -> None:
+        text = "#####\n|@..|\n#####"
+        self.assertEqual(_strip_thinking_tags(text), text)
+
+    def test_removes_multiple_complete_blocks(self) -> None:
+        text = "<think>first</think>row1\n<think>second</think>row2"
+        result = _strip_thinking_tags(text)
+        self.assertIn("row1", result)
+        self.assertIn("row2", result)
+        self.assertNotIn("first", result)
+        self.assertNotIn("second", result)
+
+    def test_case_insensitive(self) -> None:
+        text = "<THINK>upper case reasoning</THINK>\nmap line"
+        result = _strip_thinking_tags(text)
+        self.assertNotIn("upper case", result)
+        self.assertIn("map line", result)

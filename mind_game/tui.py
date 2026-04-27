@@ -111,6 +111,10 @@ class MindGameApp(App[None]):
         self._last_redraw_size: tuple[int, int] = (0, 0)
         self._pending_map_viewport: dict[str, int] | None = None
         self._map_worker: object | None = None
+        self._status_turn = self.engine.session.turn
+        self._status_scene_id = "-"
+        self._scene_description = ""
+        self._scene_summary = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="status")
@@ -123,7 +127,7 @@ class MindGameApp(App[None]):
     def on_mount(self) -> None:
         logger.info("tui mount model=%s base_url=%s", self.model_name, self.base_url)
         self._load_initial_chat()
-        self.current_scene_ascii = self._latest_scene_ascii()
+        self._refresh_story_cache()
         self._refresh_dashboard()
         self.set_interval(0.2, self._tick_spinner)
         self._update_engine_scene_viewport_hint()
@@ -186,10 +190,10 @@ class MindGameApp(App[None]):
 
     def _finish_turn(self, turn: EngineTurn) -> None:
         self._append_chat("Narrator", turn.reply)
-        if turn.scene_ascii:
-            self.current_scene_ascii = turn.scene_ascii
-        else:
-            self.current_scene_ascii = self._latest_scene_ascii()
+        self._status_turn = self.engine.session.turn
+        if turn.scene_description:
+            self._scene_description = turn.scene_description
+        self._refresh_story_cache()
         if turn.observations:
             self.status_mode = "tool_call"
             self.status_message = turn.observations[-1].tool
@@ -244,11 +248,8 @@ class MindGameApp(App[None]):
         player_input.focus()
 
     def _status_text(self) -> Text:
-        session = None
-        if self.story_store is not None and self.engine.story_session_id is not None:
-            session = self.story_store.load_session(self.engine.story_session_id)
-        turn = getattr(session, "current_turn", self.engine.session.turn)
-        scene = getattr(session, "current_scene_id", None) or "-"
+        turn = self._status_turn
+        scene = self._status_scene_id
         width = max(12, self.query_one("#status", Static).size.width)
         value_width = max(1, width - len("mdl: "))
         status = Text()
@@ -321,24 +322,29 @@ class MindGameApp(App[None]):
             return f"map {spinner}"
         return self.status_mode
 
-    def _latest_scene_ascii(self) -> str:
+    def _refresh_story_cache(self) -> None:
+        self._status_turn = self.engine.session.turn
         if self.story_store is None or self.engine.story_session_id is None:
-            return ""
+            return
+        session = self.story_store.load_session(self.engine.story_session_id)
+        if session is not None:
+            self._status_turn = session.current_turn
+            self._status_scene_id = session.current_scene_id or "-"
         snapshot = self.story_store.latest_snapshot(self.engine.story_session_id)
         if snapshot is None:
-            return ""
-        return str(snapshot.state.get("scene_ascii") or "")
-
-    def _latest_scene_description(self) -> str:
-        if self.story_store is None or self.engine.story_session_id is None:
-            return ""
-        snapshot = self.story_store.latest_snapshot(self.engine.story_session_id)
-        if snapshot is None:
-            return ""
-        return str(snapshot.state.get("scene_description") or "").strip()
+            return
+        self._scene_description = str(snapshot.state.get("scene_description") or "").strip()
+        self._scene_summary = snapshot.summary_text
+        latest_ascii = str(snapshot.state.get("scene_ascii") or "")
+        if latest_ascii:
+            if not self.current_scene_ascii or _has_meaningful_map_content(latest_ascii):
+                logger.debug("story cache updated current_scene_ascii chars=%d meaningful=%s", len(latest_ascii), _has_meaningful_map_content(latest_ascii))
+                self.current_scene_ascii = latest_ascii
+            else:
+                logger.debug("story cache skipped low-signal ascii chars=%d existing_chars=%d", len(latest_ascii), len(self.current_scene_ascii))
 
     def _scene_description_text(self) -> Text:
-        description = self._latest_scene_description() or "No stored scene description yet."
+        description = self._scene_description or "No stored scene description yet."
         width = max(12, self.query_one("#scene_description", Static).size.width)
         value_width = max(1, width - len("desc: "))
         text = Text()
@@ -347,12 +353,7 @@ class MindGameApp(App[None]):
         return text
 
     def _placeholder_scene(self) -> str:
-        summary = ""
-        if self.story_store is not None and self.engine.story_session_id is not None:
-            snapshot = self.story_store.latest_snapshot(self.engine.story_session_id)
-            if snapshot is not None:
-                summary = snapshot.summary_text
-        return summary or "Map will appear after the next scene."
+        return self._scene_summary or "Map will appear after the next scene."
 
     def _start_map_stream(self, viewport: dict[str, int]) -> None:
         if not hasattr(self.engine, "stream_map"):
@@ -416,8 +417,10 @@ class MindGameApp(App[None]):
         if usage is not None:
             self._map_stream_usage = usage
         if content:
-            self.current_scene_ascii = _clip_scene_ascii_for_viewport(content, self._map_stream_viewport)
-            self._map_stream_line_count = len(self.current_scene_ascii.splitlines())
+            clipped = _clip_scene_ascii_for_viewport(content, self._map_stream_viewport)
+            self._map_stream_line_count = len(clipped.splitlines())
+            if not self.current_scene_ascii or _has_meaningful_map_content(clipped):
+                self.current_scene_ascii = clipped
         if self._map_stream_viewport is not None:
             _, rows = self._map_stream_viewport
             self.status_mode = "map"
@@ -433,7 +436,14 @@ class MindGameApp(App[None]):
             return
         self._clear_map_timeout()
         if final_ascii:
-            self.current_scene_ascii = _clip_scene_ascii_for_viewport(final_ascii, self._map_stream_viewport)
+            clipped = _clip_scene_ascii_for_viewport(final_ascii, self._map_stream_viewport)
+            meaningful = _has_meaningful_map_content(clipped)
+            if not self.current_scene_ascii or meaningful:
+                logger.info("map stream final applied chars=%d meaningful=%s viewport=%s", len(clipped), meaningful, self._map_stream_viewport)
+                self.current_scene_ascii = clipped
+            else:
+                logger.info("map stream final skipped low-signal chars=%d existing_chars=%d viewport=%s", len(clipped), len(self.current_scene_ascii), self._map_stream_viewport)
+        self._refresh_story_cache()
         self.is_streaming_map = False
         self._map_stream_viewport = None
         self._map_stream_line_count = 0
@@ -614,6 +624,10 @@ def _clip_scene_ascii_for_viewport(art: str, viewport: tuple[int, int] | None) -
     if cols <= 0 or rows <= 0:
         return art
     return "\n".join(line[:cols] for line in art.splitlines()[:rows])
+
+
+def _has_meaningful_map_content(art: str) -> bool:
+    return any(char not in {".", "#", " ", "\n", "\r", "\t"} for char in art)
 
 
 def _clear_wall_fill_line(line: str, width: int) -> str:

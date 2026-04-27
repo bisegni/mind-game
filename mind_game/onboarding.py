@@ -5,6 +5,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+_THINK_COMPLETE_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    text = _THINK_COMPLETE_RE.sub("", text)
+    text = _THINK_OPEN_RE.sub("", text)
+    return text.lstrip("\n")
+
 
 _NORMALIZED_KEYS = (
     "genre",
@@ -395,13 +404,14 @@ class OllamaOnboardingReasoner:
 
     def next_question(self, snapshot: Mapping[str, Any], *, missing_field: str, attempt_count: int = 0) -> str:
         prompt = build_onboarding_question_prompt(snapshot, missing_field=missing_field, attempt_count=attempt_count)
-        response = self.model.invoke(
-            [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.content if isinstance(response.content, str) else str(response.content)
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        accumulated = ""
+        for chunk in self.model.stream(messages):
+            accumulated += chunk.content or ""
+        content = _strip_thinking_tags(accumulated)
         payload = self._extract_payload(content)
         if payload is not None:
             text = _coerce_message_text(payload.get("content"), required_field_prompt(missing_field, attempt_count=attempt_count))
@@ -410,13 +420,14 @@ class OllamaOnboardingReasoner:
 
     def extract_updates(self, snapshot: Mapping[str, Any], *, answer_text: str, asked_field: str) -> dict[str, Any]:
         prompt = build_onboarding_extraction_prompt(snapshot, asked_field=asked_field, answer_text=answer_text)
-        response = self.model.invoke(
-            [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.content if isinstance(response.content, str) else str(response.content)
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        accumulated = ""
+        for chunk in self.model.stream(messages):
+            accumulated += chunk.content or ""
+        content = _strip_thinking_tags(accumulated)
         updates = self._parse_updates(content, asked_field=asked_field, answer_text=answer_text)
         if updates:
             return updates

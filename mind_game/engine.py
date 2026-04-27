@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
@@ -239,19 +240,21 @@ class BaseReActEngine:
         for raw_chunk in self._reasoner.stream_map(snapshot, viewport):
             chunk = _coerce_stream_chunk(raw_chunk)
             accumulated += chunk.content
-            visible = _normalize_streamed_map_for_viewport(accumulated, viewport_size, final=False)
+            map_content = _strip_thinking_tags(accumulated)
+            visible = _normalize_streamed_map_for_viewport(map_content, viewport_size, final=False)
             if on_chunk is not None:
                 if chunk.usage is None:
                     on_chunk(visible)
                 else:
                     on_chunk(StreamChunk(content=visible, usage=chunk.usage))
             if (
-                _streamed_map_is_complete(accumulated, viewport_size)
-                or len(accumulated) >= raw_budget
+                _streamed_map_is_complete(map_content, viewport_size)
+                or len(map_content) >= raw_budget
                 or _streamed_map_usage_exhausted(chunk.usage, viewport_size)
             ):
                 break
-        final = _normalize_streamed_map_for_viewport(accumulated, viewport_size, final=True).rstrip("\n")
+        map_content = _strip_thinking_tags(accumulated)
+        final = _normalize_streamed_map_for_viewport(map_content, viewport_size, final=True).rstrip("\n")
         if _has_raw_wall_spam(accumulated, viewport_size) or _is_degenerate_map(final, viewport_size):
             logger.warning("map stream produced degenerate output; using fallback map")
             final = _fallback_scene_map(snapshot, viewport_size)
@@ -454,6 +457,22 @@ def _viewport_size(viewport: Mapping[str, int]) -> tuple[int, int] | None:
     if cols <= 0 or rows <= 0:
         return None
     return cols, rows
+
+
+_THINK_COMPLETE_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    """Remove completed <think>…</think> blocks and any trailing unclosed <think> section.
+
+    Works for Qwen, DeepSeek-R1, and any model that emits reasoning inside <think> tags.
+    The raw accumulated buffer is kept intact for wall-spam checks; only the visible
+    content passed to the normaliser and the on_chunk callback is stripped.
+    """
+    text = _THINK_COMPLETE_RE.sub("", text)
+    text = _THINK_OPEN_RE.sub("", text)
+    return text.lstrip("\n")
 
 
 def _normalize_streamed_map_for_viewport(text: str, viewport: tuple[int, int] | None, *, final: bool) -> str:

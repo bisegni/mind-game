@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mind_game.engine import ReActDecision
+from mind_game.engine import ReActDecision, StreamChunk
 from mind_game.onboarding import REQUIRED_ONBOARDING_FIELDS
 from mind_game.story_state import StoryStateStore
 
@@ -74,9 +74,67 @@ class CliTests(unittest.TestCase):
     def test_resolve_model_name_fetches_first_openai_model_when_unset(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             with patch.object(cli, "fetch_openai_available_models", return_value=["gpt-4.1-mini", "gpt-4.1"]):
-                model_name = cli.resolve_model_name("https://api.openai.com")
+                model_name = cli.resolve_model_name("https://api.openai.com", interactive=False)
 
         self.assertEqual(model_name, "gpt-4.1-mini")
+
+    def test_resolve_model_name_auto_picks_single_model_without_prompt(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models", return_value=["only-model"]):
+                with patch.object(cli, "_prompt_model_selection") as mock_prompt:
+                    model_name = cli.resolve_model_name("http://example.local", interactive=True)
+
+        self.assertEqual(model_name, "only-model")
+        mock_prompt.assert_not_called()
+
+    def test_resolve_model_name_prompts_when_multiple_models_interactive(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2", "mistral-nemo"]
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models", return_value=models):
+                with patch.object(cli, "_prompt_model_selection", return_value="llama3.2") as mock_prompt:
+                    model_name = cli.resolve_model_name("http://example.local", interactive=True)
+
+        self.assertEqual(model_name, "llama3.2")
+        mock_prompt.assert_called_once_with(models)
+
+    def test_resolve_model_name_skips_prompt_when_not_interactive(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2"]
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(cli, "fetch_openai_available_models", return_value=models):
+                with patch.object(cli, "_prompt_model_selection") as mock_prompt:
+                    model_name = cli.resolve_model_name("http://example.local", interactive=False)
+
+        self.assertEqual(model_name, "Qwen3.5-9B")
+        mock_prompt.assert_not_called()
+
+    def test_prompt_model_selection_returns_default_on_empty_input(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2", "mistral-nemo"]
+        with patch("builtins.input", return_value=""):
+            with redirect_stdout(io.StringIO()):
+                result = cli._prompt_model_selection(models)
+        self.assertEqual(result, "Qwen3.5-9B")
+
+    def test_prompt_model_selection_returns_chosen_model(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2", "mistral-nemo"]
+        with patch("builtins.input", return_value="2"):
+            with redirect_stdout(io.StringIO()):
+                result = cli._prompt_model_selection(models)
+        self.assertEqual(result, "llama3.2")
+
+    def test_prompt_model_selection_retries_on_invalid_then_defaults(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2"]
+        inputs = iter(["x", "99", ""])
+        with patch("builtins.input", side_effect=inputs):
+            with redirect_stdout(io.StringIO()):
+                result = cli._prompt_model_selection(models)
+        self.assertEqual(result, "Qwen3.5-9B")
+
+    def test_prompt_model_selection_handles_eof(self) -> None:
+        models = ["Qwen3.5-9B", "llama3.2"]
+        with patch("builtins.input", side_effect=EOFError):
+            with redirect_stdout(io.StringIO()):
+                result = cli._prompt_model_selection(models)
+        self.assertEqual(result, "Qwen3.5-9B")
 
     def test_fetch_openai_available_models_reads_model_ids(self) -> None:
         class FakeResponse:
@@ -663,9 +721,9 @@ class CliTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = []
 
-            def invoke(self, messages):
+            def stream(self, messages, **kwargs):
                 self.calls.append(messages)
-                return SimpleNamespace(content='{"kind":"final","content":"ready"}')
+                yield StreamChunk(content='{"kind":"final","content":"ready"}', usage=None)
 
         model = PromptRecordingModel()
         reasoner = cli.OllamaReActReasoner(model=model, system_prompt="system prompt")
@@ -691,10 +749,8 @@ class CliTests(unittest.TestCase):
 
     def test_reasoner_decide_accepts_final_scene_ascii_payload(self) -> None:
         class PromptRecordingModel:
-            def invoke(self, messages):
-                return SimpleNamespace(
-                    content='{"kind":"final","content":"The hatch opens.","scene_description":"Player is inside a chamber with a hatch south.","scene_ascii":"+---+\\n| * |\\n+---+"}',
-                )
+            def stream(self, messages, **kwargs):
+                yield StreamChunk(content='{"kind":"final","content":"The hatch opens.","scene_description":"Player is inside a chamber with a hatch south.","scene_ascii":"+---+\\n| * |\\n+---+"}', usage=None)
 
         reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
 
@@ -707,8 +763,8 @@ class CliTests(unittest.TestCase):
 
     def test_reasoner_decide_uses_plain_text_as_scene_description(self) -> None:
         class PromptRecordingModel:
-            def invoke(self, messages):
-                return SimpleNamespace(content="You stand beside a humming console.")
+            def stream(self, messages, **kwargs):
+                yield StreamChunk(content="You stand beside a humming console.", usage=None)
 
         reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
 
@@ -720,8 +776,8 @@ class CliTests(unittest.TestCase):
 
     def test_reasoner_decide_uses_content_as_scene_description_when_missing(self) -> None:
         class PromptRecordingModel:
-            def invoke(self, messages):
-                return SimpleNamespace(content='{"kind":"final","content":"You stand in a chamber."}')
+            def stream(self, messages, **kwargs):
+                yield StreamChunk(content='{"kind":"final","content":"You stand in a chamber."}', usage=None)
 
         reasoner = cli.OllamaReActReasoner(model=PromptRecordingModel(), system_prompt="system prompt")
 
@@ -736,10 +792,11 @@ class CliTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = []
 
-            def invoke(self, messages):
+            def stream(self, messages, **kwargs):
                 self.calls.append(messages)
-                return SimpleNamespace(
+                yield StreamChunk(
                     content='{"kind":"question","content":{"genre":null,"story_promises":["A thought-provoking narrative experience."]},"updates":{"genre":"sci-fi"}}',
+                    usage=None,
                 )
 
         model = PromptRecordingModel()

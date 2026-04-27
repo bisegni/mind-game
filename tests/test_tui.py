@@ -90,14 +90,15 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.inputs, ["i open the door"])
             rendered = str(situation.render())
             self.assertIn("MAP / SITUATION", rendered)
-            self.assertIn("@", rendered)
-            self.assertIn("+----+", rendered)
+            # map comes from stream_map (separate call), not from scene_ascii in run_turn
+            self.assertNotIn("+----+", rendered)
             self.assertNotIn("Map / ", rendered)
             self.assertGreaterEqual(len(chat.lines), 2)
             self.assertIn("st: idle", str(status.render()))
             self.assertFalse(player_input.disabled)
 
-    async def test_sparse_scene_ascii_is_framed_verbatim_in_panel(self) -> None:
+    async def test_story_turn_scene_ascii_is_not_used_directly(self) -> None:
+        """Map must come from stream_map, not from EngineTurn.scene_ascii."""
         class SparseSceneEngine:
             story_session_id = None
 
@@ -133,8 +134,9 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
 
             rendered = str(app.query_one("#situation", Static).render())
             self.assertIn("MAP / SITUATION", rendered)
-            self.assertIn("/\\", rendered)
-            self.assertIn("||", rendered)
+            # scene_ascii from run_turn is intentionally NOT displayed directly;
+            # the map panel shows a placeholder until stream_map completes.
+            self.assertNotIn("/\\", rendered)
 
     async def test_latest_scene_description_is_shown_for_debugging(self) -> None:
         store = StoryStateStore()
@@ -311,6 +313,61 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mdl:", rendered)
         self.assertNotIn("scene:", rendered)
         self.assertNotIn("model:", rendered)
+
+    async def test_spinner_refresh_uses_cached_story_status(self) -> None:
+        class CacheOnlyStore:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def load_session(self, session_id):
+                if self.closed:
+                    raise AssertionError("spinner refresh should not load the session")
+                return SimpleNamespace(current_turn=4, current_scene_id="scene:bridge")
+
+            def latest_snapshot(self, session_id):
+                if self.closed:
+                    raise AssertionError("spinner refresh should not load the snapshot")
+                return SimpleNamespace(
+                    summary_text="Bridge summary.",
+                    state={"scene_description": "A bridge spans the gap.", "scene_ascii": "@..?"},
+                )
+
+            def list_turns(self, session_id, limit=None):
+                return []
+
+        class Engine:
+            story_session_id = 1
+            session = SimpleNamespace(turn=4)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        store = CacheOnlyStore()
+        app = MindGameApp(
+            engine=Engine(),
+            story_store=store,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test() as pilot:
+            # Let the mount-triggered map stream complete (stream_map returns ""
+            # immediately, but call_from_thread needs an event-loop tick to run).
+            await pilot.pause(0.1)
+            store.closed = True
+            app.is_streaming_map = True
+
+            app._tick_spinner()
+
+            rendered = str(app.query_one("#status", Static).render())
+            self.assertIn("t: 4", rendered)
+            self.assertIn("sc: bridge", rendered)
 
     async def test_llm_viewport_caps_aspect_ratio_and_size(self) -> None:
         class IdleEngine:
@@ -548,6 +605,179 @@ class MindGameAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_scene_ascii, "@...\n####")
             rendered_status = str(app.query_one("#status", Static).render())
             self.assertIn("map: streaming 2/4 tok 3", rendered_status)
+
+    async def test_low_signal_partial_map_does_not_clear_current_map(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.is_streaming_map = True
+            app._map_stream_viewport = (8, 3)
+            app.current_scene_ascii = "....@...\n..*DEV..\n....?..."
+
+            app._apply_partial_scene("........\n########\n        ")
+
+            self.assertEqual(app.current_scene_ascii, "....@...\n..*DEV..\n....?...")
+            rendered_status = str(app.query_one("#status", Static).render())
+            self.assertIn("map: streaming 3/3", rendered_status)
+
+    async def test_low_signal_final_does_not_overwrite_good_map(self) -> None:
+        """Final from stream is all dots/walls (thinking-model output after normalization).
+        Neither _finish_map_stream nor _refresh_story_cache should replace a meaningful
+        existing map — even when the store was updated with the low-signal content by the
+        engine before it returned."""
+
+        GOOD_MAP = "....@...\n..*DEV..\n....?..."
+        LOW_SIGNAL_MAP = "........\n########\n        "
+
+        class StoreWithLowSignal:
+            """Simulates store that was updated by engine with low-signal final BEFORE
+            _finish_map_stream runs on the main thread."""
+
+            def load_session(self, session_id):
+                return SimpleNamespace(current_turn=3, current_scene_id="scene:alpha")
+
+            def latest_snapshot(self, session_id):
+                return SimpleNamespace(
+                    summary_text="The ship corridor.",
+                    state={
+                        "scene_description": "A metallic corridor.",
+                        "scene_ascii": LOW_SIGNAL_MAP,
+                    },
+                )
+
+            def list_turns(self, session_id, limit=None):
+                return []
+
+        class IdleEngine:
+            story_session_id = 1
+            session = SimpleNamespace(turn=3)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=StoreWithLowSignal(),
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            # Let mount-triggered stream settle before we take manual control.
+            await pilot.pause(0.1)
+            app.is_streaming_map = True
+            app._map_stream_viewport = (8, 3)
+            app.current_scene_ascii = GOOD_MAP
+
+            # _finish_map_stream receives low-signal final AND store also has low-signal.
+            app._finish_map_stream(LOW_SIGNAL_MAP)
+
+            # Good map must survive both the stream-final guard AND _refresh_story_cache.
+            self.assertEqual(app.current_scene_ascii, GOOD_MAP)
+            rendered = str(app.query_one("#situation", Static).render())
+            # Header always present; map body rendered with proper widget size.
+            self.assertIn("MAP / SITUATION", rendered)
+            self.assertIn("@", rendered)
+            self.assertIn("DEV", rendered)
+
+    async def test_empty_map_accepts_low_signal_partial_chunk(self) -> None:
+        class IdleEngine:
+            story_session_id = None
+            session = SimpleNamespace(turn=0)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=None,
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.is_streaming_map = True
+            app._map_stream_viewport = (8, 3)
+            app.current_scene_ascii = ""
+
+            app._apply_partial_scene("........\n########\n        ")
+
+            self.assertEqual(app.current_scene_ascii, "........\n########\n        ")
+
+    async def test_empty_final_still_refreshes_story_cache(self) -> None:
+        class StoreWithSession:
+            def load_session(self, session_id):
+                return SimpleNamespace(current_turn=7, current_scene_id="scene:vault")
+
+            def latest_snapshot(self, session_id):
+                return SimpleNamespace(
+                    summary_text="The vault.",
+                    state={"scene_description": "A dark vault.", "scene_ascii": ""},
+                )
+
+            def list_turns(self, session_id, limit=None):
+                return []
+
+        class IdleEngine:
+            story_session_id = 1
+            session = SimpleNamespace(turn=7)
+
+            def run_turn(self, player_input):
+                raise AssertionError("not used")
+
+            def stream_map(self, *, viewport, on_chunk=None):
+                return ""
+
+            def redraw_scene(self, *, viewport):
+                return ""
+
+        app = MindGameApp(
+            engine=IdleEngine(),
+            story_store=StoreWithSession(),
+            model_name="test-model",
+            base_url="http://example.local",
+        )
+
+        async with app.run_test():
+            app.is_streaming_map = True
+            app._map_stream_viewport = (8, 3)
+            app._status_turn = 0
+            app._status_scene_id = "-"
+
+            app._finish_map_stream("")
+
+            self.assertEqual(app._status_turn, 7)
+            self.assertEqual(app._status_scene_id, "scene:vault")
 
     async def test_stale_map_finish_after_timeout_does_not_clear_error_status(self) -> None:
         class IdleEngine:

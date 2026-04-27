@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import shutil
 import time
@@ -14,7 +15,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .diagnostics import configure_logging, get_logger
-from .engine import BaseReActEngine, ReActDecision, StreamChunk, TokenUsage, Tool, ToolCall
+from .engine import BaseReActEngine, ReActDecision, StreamChunk, TokenUsage, Tool, ToolCall, _strip_thinking_tags
 from .console import ConsoleMessage, load_session_messages, render_message_batch, render_session_history, stream_message
 from .scene_renderer import render_scene_frame
 from .shell import SceneFrame as ShellSceneFrame, ShellMode, ShellStatus, render_split_pane
@@ -131,7 +132,16 @@ class OpenAICompatibleChatClient:
                             )
                         yield StreamChunk(content=content, usage=usage)
                 logger.info("chat stream finished endpoint=%s chunks=%s", endpoint, chunk_count)
-        except (OSError, URLError) as error:
+        except URLError as error:
+            body = ""
+            if hasattr(error, "read"):
+                try:
+                    body = error.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+            logger.error("chat stream failed endpoint=%s body=%r", endpoint, body)
+            raise RuntimeError(f"Unable to stream chat completion from {endpoint}: {error} body={body!r}") from error
+        except OSError as error:
             logger.exception("chat stream failed endpoint=%s", endpoint)
             raise RuntimeError(f"Unable to stream chat completion from {endpoint}: {error}") from error
 
@@ -150,7 +160,7 @@ class OpenAICompatibleChatClient:
         }
         if extra_payload is not None:
             payload.update(dict(extra_payload))
-        if stream:
+        if stream and not os.environ.get("MIND_GAME_NO_STREAM_OPTIONS"):
             payload["stream_options"] = {"include_usage": True}
         return payload
 
@@ -172,15 +182,19 @@ class OpenAICompatibleReActReasoner:
 
     def decide(self, snapshot: Mapping[str, Any], tools: Sequence[Tool]) -> ReActDecision:
         prompt = self._build_prompt(snapshot, tools)
-        response = self.client.invoke(
-            [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.content if isinstance(response.content, str) else str(response.content)
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        accumulated = ""
+        last_usage = None
+        for chunk in self.client.stream(messages):
+            accumulated += chunk.content or ""
+            if chunk.usage is not None and getattr(chunk.usage, "total_tokens", None) is not None:
+                last_usage = chunk.usage
+        content = _strip_thinking_tags(accumulated)
         decision = self._parse_decision(content)
-        decision.usage = getattr(response, "usage", None)
+        decision.usage = last_usage
         return decision
 
     def stream_map(self, snapshot: Mapping[str, Any], viewport: Mapping[str, int] | None = None):
@@ -199,7 +213,8 @@ class OpenAICompatibleReActReasoner:
             [
                 "You are running a bounded ReAct turn for the Mind Game prototype.",
                 "Choose exactly one action per response.",
-                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"...","scene_description":"...","scene_ascii":"..."}.',
+                'Return JSON only as either {"kind":"tool","tool":"<name>","arguments":{...}} or {"kind":"final","content":"<narrator prose>","scene_description":"<spatial description for map generation>"}.',
+                "Do NOT include scene_ascii in your response. The map is generated separately from scene_description.",
                 "Use tools when you need session state or bounded delegation.",
                 "Keep tool arguments small and explicit.",
                 build_turn_prompt(snapshot, tools),
@@ -208,6 +223,10 @@ class OpenAICompatibleReActReasoner:
 
     def _parse_decision(self, content: str) -> ReActDecision:
         text = content.strip()
+        # strip markdown code fences e.g. ```json ... ``` or ``` ... ```
+        if text.startswith("```"):
+            text = re.sub(r"^```[^\n]*\n?", "", text)
+            text = re.sub(r"\n?```\s*$", "", text).strip()
         if not text.startswith("{"):
             return ReActDecision(kind="final", content=text, scene_description=text)
 
@@ -306,7 +325,7 @@ def openai_chat_completions_endpoint(base_url: str) -> str:
     return urljoin(normalize_openai_base_url(base_url).rstrip("/") + "/", "chat/completions")
 
 
-def resolve_model_name(base_url: str) -> str:
+def resolve_model_name(base_url: str, *, interactive: bool = True) -> str:
     configured_model = os.environ.get("MIND_GAME_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("OLLAMA_MODEL")
     if configured_model:
         return configured_model
@@ -314,6 +333,30 @@ def resolve_model_name(base_url: str) -> str:
     models = fetch_openai_available_models(base_url)
     if not models:
         raise RuntimeError(f"No models returned by {openai_models_endpoint(base_url)}")
+    if len(models) == 1 or not interactive:
+        return models[0]
+    return _prompt_model_selection(models)
+
+
+def _prompt_model_selection(models: list[str]) -> str:
+    print("\nAvailable models:")
+    for i, name in enumerate(models, 1):
+        suffix = "  ← default" if i == 1 else ""
+        print(f"  {i}. {name}{suffix}")
+    for _ in range(3):
+        try:
+            raw = input(f"\nSelect model [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not raw:
+            break
+        try:
+            choice = int(raw)
+            if 1 <= choice <= len(models):
+                return models[choice - 1]
+        except ValueError:
+            pass
+        print(f"  Invalid — enter a number between 1 and {len(models)}.")
     return models[0]
 
 
@@ -343,11 +386,24 @@ def fetch_openai_available_models(base_url: str) -> list[str]:
     return model_ids
 
 
+def _read_token_from_file(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _auth_headers(*, accept: str = "application/json") -> dict[str, str]:
     headers = {"Accept": accept}
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    token = os.environ.get("MIND_GAME_JWT") or os.environ.get("OPENAI_API_KEY")
+    if not token:
+        jwt_file = os.environ.get("MIND_GAME_JWT_FILE")
+        if jwt_file:
+            token = _read_token_from_file(jwt_file)
+    if token:
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
     return headers
 
 
@@ -537,7 +593,7 @@ def main() -> int:
     base_url = resolve_base_url()
     logger.info("app main start base_url=%s log_path=%s", base_url, log_path)
     try:
-        model_name = resolve_model_name(base_url)
+        model_name = resolve_model_name(base_url, interactive=sys.stdout.isatty())
     except RuntimeError as error:
         logger.exception("model selection failed")
         print(f"Model selection failed: {error}")

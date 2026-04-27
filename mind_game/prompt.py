@@ -26,8 +26,9 @@ PROMPT_ERROR_LAYER = (
 MAP_SYSTEM_PROMPT = (
     "You draw an ASCII tile map for the Mind Game viewport. Output ONLY raw ASCII map characters. "
     "No JSON, no markdown, no code fences, no title, no legend, no preface, no trailing prose, "
-    "no commentary. Begin the response with the first line of the map and stop immediately after "
-    "the final required map row."
+    "no commentary, no thinking preamble. "
+    "Your very first output character must be the first character of map row 1. "
+    "Stop immediately after the final required map row."
 )
 MAP_INSTRUCTIONS_LAYER = (
     "Draw a tile map of the current scene that depicts what the narration just described. "
@@ -103,6 +104,7 @@ def build_map_prompt(snapshot: Mapping[str, Any], viewport: Mapping[str, int] | 
     }
     return "\n".join(
         [
+            "/no_think",
             MAP_INSTRUCTIONS_LAYER,
             f"Target viewport: EXACTLY {cols} columns by EXACTLY {rows} rows.",
             f"Output MUST contain exactly {rows} lines.",
@@ -111,7 +113,7 @@ def build_map_prompt(snapshot: Mapping[str, Any], viewport: Mapping[str, int] | 
             "Use the full available viewport area while staying inside the exact row and column counts.",
             "Map source priority: scene_description first, then latest_narrator_message, then summary_text and facts.",
             f"Scene context: {json.dumps(context, sort_keys=True)}",
-            "Output the map now, raw ASCII only.",
+            "Output the map now. Begin with map row 1 immediately — zero preamble.",
         ]
     )
 
