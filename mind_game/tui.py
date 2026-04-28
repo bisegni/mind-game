@@ -135,6 +135,9 @@ class MindGameApp(App[None]):
         self._onboarding_lore_text = ""
         self._onboarding_asked_field: str | None = None
         self._onboarding_current_question = ""
+        # Animation state
+        self._animation_frame: int = 0
+        self._map_animator: _MapAnimator | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="status")
@@ -147,6 +150,7 @@ class MindGameApp(App[None]):
     def on_mount(self) -> None:
         logger.info("tui mount model=%s base_url=%s is_onboarding=%s", self.model_name, self.base_url, self._is_onboarding)
         self.set_interval(0.2, self._tick_spinner)
+        self.set_interval(0.4, self._animate_scene)
         if self._is_onboarding:
             self._refresh_dashboard()
             input_widget = self.query_one("#player_input", Input)
@@ -229,6 +233,7 @@ class MindGameApp(App[None]):
         self._status_turn = self.engine.session.turn
         if turn.scene_description:
             self._scene_description = turn.scene_description
+        self._map_animator = None
         self._refresh_story_cache()
         if turn.observations:
             self.status_mode = "tool_call"
@@ -271,6 +276,15 @@ class MindGameApp(App[None]):
         self.query_one("#status", Static).update(self._status_text())
         self.query_one("#situation", Static).update(self._situation_text())
         self.query_one("#scene_description", Static).update(self._scene_description_text())
+
+    def _animate_scene(self) -> None:
+        if self._is_onboarding or self.is_streaming_map or self.is_waiting_for_model:
+            return
+        self._animation_frame += 1
+        try:
+            self.query_one("#situation", Static).update(self._situation_text())
+        except NoMatches:
+            pass
 
     def _tick_spinner(self) -> None:
         if not self.is_waiting_for_model and not self.is_streaming_map:
@@ -320,9 +334,13 @@ class MindGameApp(App[None]):
         if self._is_onboarding:
             return _styled_lore_text(self._onboarding_lore_text)
         cols, rows = self._widget_viewport_size()
-        art = self.current_scene_ascii.strip() or self._placeholder_scene()
+        base_art = self.current_scene_ascii.strip() or self._placeholder_scene()
+        if self._map_animator is not None:
+            animated_art = self._map_animator.frame(self._animation_frame)
+        else:
+            animated_art = _animate_map_frame(base_art, self._animation_frame)
         return _styled_map_text(
-            render_scene_map(art, cols=cols, rows=max(1, rows - 2)),
+            render_scene_map(animated_art, cols=cols, rows=max(1, rows - 2)),
         )
 
     def _widget_viewport_size(self) -> tuple[int, int]:
@@ -483,6 +501,7 @@ class MindGameApp(App[None]):
             if not self.current_scene_ascii or meaningful:
                 logger.info("map stream final applied chars=%d meaningful=%s viewport=%s", len(clipped), meaningful, self._map_stream_viewport)
                 self.current_scene_ascii = clipped
+                self._map_animator = _MapAnimator(clipped)
             else:
                 logger.info("map stream final skipped low-signal chars=%d existing_chars=%d viewport=%s", len(clipped), len(self.current_scene_ascii), self._map_stream_viewport)
         self._refresh_story_cache()
@@ -1048,6 +1067,81 @@ MAP_LEGEND_ITEMS: tuple[tuple[str, str], ...] = (
     ("~", "water"),
     ("=|+", "corridor"),
 )
+
+
+_POI_FRAMES = ("*", "\u00b7", "*", "\u2736")      # * · * ✶
+_WATER_FRAMES = ("~", "\u2248", "-", "\u2248")    # ~ ≈ - ≈
+_PLAYER_FRAMES = ("@", "@", "@", "\u00a4")        # @ @ @ ¤
+_UNKNOWN_FRAMES = ("?", "\u00b7", "?", "\u00b7")  # ? · ? ·
+
+
+def _animate_map_frame(art: str, frame: int) -> str:
+    """Apply per-character animation to a map string based on the current frame index."""
+    result = []
+    for ch in art:
+        if ch == "*":
+            result.append(_POI_FRAMES[frame % 4])
+        elif ch == "~":
+            result.append(_WATER_FRAMES[frame % 4])
+        elif ch == "@":
+            result.append(_PLAYER_FRAMES[frame % 4])
+        elif ch == "?":
+            result.append(_UNKNOWN_FRAMES[frame % 2])
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+class _MapAnimator:
+    """Animates NPC digit markers (1-9) moving on floor tiles, plus static char animation."""
+
+    def __init__(self, base_map: str) -> None:
+        import random as _random
+
+        self._rng = _random.Random()
+        rows = base_map.splitlines()
+        self._grid: list[list[str]] = [list(row) for row in rows]
+        self._width = max((len(r) for r in self._grid), default=0)
+        # Pad all rows to equal width
+        for row in self._grid:
+            while len(row) < self._width:
+                row.append(" ")
+        self._height = len(self._grid)
+        # Locate NPC digit positions {digit_char: (row, col)}
+        self._npcs: dict[str, tuple[int, int]] = {}
+        for r, row in enumerate(self._grid):
+            for c, ch in enumerate(row):
+                if ch.isdigit() and ch != "0":
+                    self._npcs[ch] = (r, c)
+        self._frame_cache: list[str] = []
+
+    def _is_walkable(self, r: int, c: int) -> bool:
+        if r < 0 or r >= self._height or c < 0 or c >= self._width:
+            return False
+        ch = self._grid[r][c]
+        return ch == "."
+
+    def _step_npcs(self) -> None:
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        for digit, (r, c) in list(self._npcs.items()):
+            self._rng.shuffle(directions)
+            for dr, dc in directions:
+                nr, nc = r + dr, c + dc
+                if self._is_walkable(nr, nc):
+                    self._grid[r][c] = "."
+                    self._grid[nr][nc] = digit
+                    self._npcs[digit] = (nr, nc)
+                    break
+
+    def frame(self, frame_index: int) -> str:
+        # Grow cache lazily
+        while len(self._frame_cache) <= frame_index:
+            if len(self._frame_cache) > 0:
+                self._step_npcs()
+            snapshot = "\n".join("".join(row) for row in self._grid)
+            self._frame_cache.append(snapshot)
+        base = self._frame_cache[frame_index]
+        return _animate_map_frame(base, frame_index)
 
 
 def _styled_lore_text(lore: str) -> Text:
