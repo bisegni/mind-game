@@ -135,7 +135,7 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
     }
     onboarding_seed = snapshot.get("onboarding_seed")
     if onboarding_seed:
-        compact_snapshot["onboarding_seed"] = {
+        seed_block: dict[str, Any] = {
             "onboarding_id": onboarding_seed.get("onboarding_id"),
             "session_id": onboarding_seed.get("session_id"),
             "scene_id": onboarding_seed.get("scene_id"),
@@ -147,6 +147,13 @@ def _format_snapshot(snapshot: Mapping[str, Any]) -> str:
             "starting_state": onboarding_seed.get("starting_state", {}),
             "memory_seed": onboarding_seed.get("memory_seed", {}),
         }
+        if onboarding_seed.get("lore"):
+            seed_block["lore"] = onboarding_seed["lore"]
+        if onboarding_seed.get("story_lines"):
+            seed_block["story_lines"] = onboarding_seed["story_lines"]
+        if onboarding_seed.get("key_npcs"):
+            seed_block["key_npcs"] = onboarding_seed["key_npcs"]
+        compact_snapshot["onboarding_seed"] = seed_block
     return f"Compact memory: {json.dumps(compact_snapshot, sort_keys=True)}"
 
 

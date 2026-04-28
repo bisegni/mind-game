@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+from typing import TYPE_CHECKING, Any
+
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -12,6 +15,10 @@ from .diagnostics import get_logger
 from .engine import BaseReActEngine, EngineTurn, StreamChunk, TokenUsage
 from .prompt import is_exit_command
 from .story_state import StoryStateStore
+
+if TYPE_CHECKING:
+    from .onboarding import OllamaOnboardingReasoner, StoryBible
+    from .story_state import OnboardingSessionRecord
 
 
 RESIZE_REDRAW_DEBOUNCE_SECONDS = 1.0
@@ -84,16 +91,22 @@ class MindGameApp(App[None]):
 
     SPINNER_FRAMES = ("|", "/", "-", "\\")
 
+    TYPEWRITER_WORD_DELAY = 0.04
+
     def __init__(
         self,
         *,
-        engine: BaseReActEngine,
+        engine: BaseReActEngine | None,
         story_store: StoryStateStore | None,
         model_name: str,
         base_url: str,
+        reasoner: Any = None,
+        onboarding_session: OnboardingSessionRecord | None = None,
+        onboarding_reasoner: OllamaOnboardingReasoner | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
+        self._reasoner = reasoner
         self.story_store = story_store
         self.model_name = model_name
         self.base_url = base_url
@@ -111,10 +124,17 @@ class MindGameApp(App[None]):
         self._last_redraw_size: tuple[int, int] = (0, 0)
         self._pending_map_viewport: dict[str, int] | None = None
         self._map_worker: object | None = None
-        self._status_turn = self.engine.session.turn
+        self._status_turn = self.engine.session.turn if self.engine is not None else 0
         self._status_scene_id = "-"
         self._scene_description = ""
         self._scene_summary = ""
+        # Onboarding state
+        self._is_onboarding = onboarding_session is not None
+        self._onboarding_session = onboarding_session
+        self._onboarding_reasoner = onboarding_reasoner
+        self._onboarding_lore_text = ""
+        self._onboarding_asked_field: str | None = None
+        self._onboarding_current_question = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="status")
@@ -125,16 +145,23 @@ class MindGameApp(App[None]):
             yield Input(placeholder="Player >", id="player_input")
 
     def on_mount(self) -> None:
-        logger.info("tui mount model=%s base_url=%s", self.model_name, self.base_url)
-        self._load_initial_chat()
-        self._refresh_story_cache()
-        self._refresh_dashboard()
+        logger.info("tui mount model=%s base_url=%s is_onboarding=%s", self.model_name, self.base_url, self._is_onboarding)
         self.set_interval(0.2, self._tick_spinner)
-        self._update_engine_scene_viewport_hint()
-        cols, rows = self._llm_viewport_size()
-        self._last_redraw_size = (cols, rows)
-        self._start_map_stream({"cols": cols, "rows": rows})
-        self.query_one("#player_input", Input).focus()
+        if self._is_onboarding:
+            self._refresh_dashboard()
+            input_widget = self.query_one("#player_input", Input)
+            input_widget.disabled = True
+            self.run_worker(self._onboarding_ask_next, thread=True)
+        else:
+            self._load_initial_chat()
+            self._refresh_story_cache()
+            self._refresh_dashboard()
+            if self.engine is not None:
+                self._update_engine_scene_viewport_hint()
+                cols, rows = self._llm_viewport_size()
+                self._last_redraw_size = (cols, rows)
+                self._start_map_stream({"cols": cols, "rows": rows})
+            self.query_one("#player_input", Input).focus()
 
     def exit(self, *args: object, **kwargs: object) -> None:
         self._prepare_for_shutdown()
@@ -158,6 +185,12 @@ class MindGameApp(App[None]):
             self.exit()
             return
 
+        if self._is_onboarding:
+            self._append_chat("Player", text)
+            event.input.disabled = True
+            self.run_worker(lambda: self._onboarding_handle_answer(text), thread=True)
+            return
+
         self._append_chat("Player", text)
         self._stop_map_stream_status()
         self.status_mode = "queued"
@@ -165,11 +198,14 @@ class MindGameApp(App[None]):
         self.is_waiting_for_model = True
         self.spinner_index = 0
         event.input.disabled = True
-        self._update_engine_scene_viewport_hint()
+        if self.engine is not None:
+            self._update_engine_scene_viewport_hint()
         self._refresh_dashboard()
         self.run_worker(lambda: self._run_turn(text), thread=True, exclusive=True)
 
     def _run_turn(self, text: str) -> None:
+        if self.engine is None:
+            return
         try:
             logger.info("story turn start chars=%s", len(text))
             self.call_from_thread(self._set_story_waiting_status, "story: waiting for narrator")
@@ -221,7 +257,7 @@ class MindGameApp(App[None]):
         self._refresh_dashboard()
 
     def _load_initial_chat(self) -> None:
-        if self.story_store is None or self.engine.story_session_id is None:
+        if self.story_store is None or self.engine is None or self.engine.story_session_id is None:
             return
         for message in load_session_messages(self.story_store, self.engine.story_session_id, limit=20):
             label = "Player" if message.role == "player" else "Narrator"
@@ -281,6 +317,8 @@ class MindGameApp(App[None]):
         return status
 
     def _situation_text(self) -> Text:
+        if self._is_onboarding:
+            return _styled_lore_text(self._onboarding_lore_text)
         cols, rows = self._widget_viewport_size()
         art = self.current_scene_ascii.strip() or self._placeholder_scene()
         return _styled_map_text(
@@ -303,6 +341,8 @@ class MindGameApp(App[None]):
         return cols, rows
 
     def _update_engine_scene_viewport_hint(self) -> None:
+        if self.engine is None:
+            return
         cols, rows = self._llm_viewport_size()
         setattr(
             self.engine,
@@ -323,6 +363,8 @@ class MindGameApp(App[None]):
         return self.status_mode
 
     def _refresh_story_cache(self) -> None:
+        if self.engine is None:
+            return
         self._status_turn = self.engine.session.turn
         if self.story_store is None or self.engine.story_session_id is None:
             return
@@ -356,7 +398,7 @@ class MindGameApp(App[None]):
         return self._scene_summary or "Map will appear after the next scene."
 
     def _start_map_stream(self, viewport: dict[str, int]) -> None:
-        if not hasattr(self.engine, "stream_map"):
+        if self.engine is None or not hasattr(self.engine, "stream_map"):
             return
         if self.is_waiting_for_model:
             self._pending_map_viewport = dict(viewport)
@@ -532,6 +574,8 @@ class MindGameApp(App[None]):
         return message
 
     def _schedule_scene_redraw(self) -> None:
+        if self.engine is None:
+            return
         if not hasattr(self.engine, "stream_map") and not hasattr(self.engine, "redraw_scene"):
             return
         if self._resize_timer is not None:
@@ -546,7 +590,7 @@ class MindGameApp(App[None]):
 
     def _trigger_scene_redraw(self) -> None:
         self._resize_timer = None
-        if self.is_waiting_for_model:
+        if self.is_waiting_for_model or self.engine is None:
             return
         cols, rows = self._llm_viewport_size()
         if (cols, rows) == self._last_redraw_size:
@@ -590,6 +634,280 @@ class MindGameApp(App[None]):
         self.is_waiting_for_model = False
         self._enable_player_input()
         self._refresh_dashboard()
+
+    # ------------------------------------------------------------------
+    # Onboarding flow
+    # ------------------------------------------------------------------
+
+    def _onboarding_typewrite_lore(self, text: str) -> None:
+        """Append text word-by-word into the map/situation area."""
+        for word in text.split():
+            self._onboarding_lore_text += word + " "
+            self.call_from_thread(self._refresh_dashboard)
+            time.sleep(self.TYPEWRITER_WORD_DELAY)
+
+    def _onboarding_ask_next(self) -> None:
+        from .onboarding import build_onboarding_prompt_state, required_field_from_setup, required_field_prompt
+
+        session = self._onboarding_session
+        if session is None or self._onboarding_reasoner is None:
+            return
+
+        snapshot = build_onboarding_prompt_state(session)
+        missing_field = required_field_from_setup(snapshot)
+
+        if missing_field is None:
+            self.call_from_thread(self._onboarding_run_bible_generation)
+            return
+
+        self.call_from_thread(self._set_onboarding_status, f"onboarding: asking {missing_field}")
+
+        attempt_count = sum(1 for a in session.answers if a.question_key == missing_field)
+        try:
+            question = self._onboarding_reasoner.next_question(
+                snapshot, missing_field=missing_field, attempt_count=attempt_count
+            ).strip()
+        except Exception:
+            logger.exception("onboarding question generation failed")
+            question = required_field_prompt(missing_field, attempt_count=attempt_count)
+
+        if not question:
+            question = required_field_prompt(missing_field, attempt_count=attempt_count)
+
+        self._onboarding_asked_field = missing_field
+        self._onboarding_current_question = question
+        self.call_from_thread(self._onboarding_show_question, question)
+
+    def _onboarding_show_question(self, question: str) -> None:
+        self._append_chat("Narrator", question)
+        self.status_mode = "idle"
+        self.status_message = "onboarding: waiting for answer"
+        self._refresh_dashboard()
+        self._enable_player_input()
+
+    def _set_onboarding_status(self, message: str) -> None:
+        self.status_mode = "story"
+        self.status_message = message
+        self._refresh_dashboard()
+
+    def _onboarding_handle_answer(self, answer_text: str) -> None:
+        from .onboarding import (
+            REQUIRED_ONBOARDING_FIELDS,
+            build_onboarding_prompt_state,
+            normalize_onboarding_setup,
+            required_field_from_setup,
+            required_field_prompt,
+        )
+
+        session = self._onboarding_session
+        if session is None or self._onboarding_reasoner is None or self.story_store is None:
+            return
+
+        asked_field = self._onboarding_asked_field or REQUIRED_ONBOARDING_FIELDS[0]
+        self.call_from_thread(self._set_onboarding_status, f"onboarding: processing {asked_field}")
+
+        snapshot = build_onboarding_prompt_state(session)
+        try:
+            extracted = self._onboarding_reasoner.extract_updates(
+                snapshot, answer_text=answer_text, asked_field=asked_field
+            )
+        except Exception:
+            logger.exception("onboarding extraction failed")
+            extracted = {}
+
+        merged = dict(session.normalized_setup)
+        if extracted:
+            merged.update(extracted)
+        normalized = normalize_onboarding_setup(merged, question_order=REQUIRED_ONBOARDING_FIELDS)
+        answer_index = len(session.answers)
+        for offset, field in enumerate(REQUIRED_ONBOARDING_FIELDS):
+            if field not in extracted:
+                continue
+            self.story_store.record_onboarding_answer(
+                session.id,
+                question_key=field,
+                question_text=required_field_prompt(field, attempt_count=answer_index + offset),
+                answer_index=answer_index + offset,
+                raw_answer_text=answer_text,
+                normalized_answer={field: extracted[field]},
+            )
+        if asked_field not in extracted:
+            self.story_store.record_onboarding_answer(
+                session.id,
+                question_key=asked_field,
+                question_text=self._onboarding_current_question,
+                answer_index=answer_index + len(extracted),
+                raw_answer_text=answer_text,
+                normalized_answer={},
+            )
+        self._onboarding_session = self.story_store.update_onboarding_session(
+            session.id,
+            status="in_progress",
+            normalized_setup=normalized,
+            question_order=REQUIRED_ONBOARDING_FIELDS,
+        )
+
+        missing = required_field_from_setup(build_onboarding_prompt_state(self._onboarding_session))
+        if missing is None:
+            self.call_from_thread(self._onboarding_run_bible_generation)
+        else:
+            self._onboarding_ask_next()
+
+    def _onboarding_run_bible_generation(self) -> None:
+        self.status_mode = "story"
+        self.status_message = "onboarding: building story bible..."
+        self._refresh_dashboard()
+        input_widget = self.query_one("#player_input", Input)
+        input_widget.disabled = True
+        self.run_worker(self._onboarding_generate_bible, thread=True)
+
+    def _onboarding_generate_bible(self) -> None:
+        from .onboarding import (
+            REQUIRED_ONBOARDING_FIELDS,
+            build_onboarding_seed_scene,
+            generate_story_bible,
+            normalize_onboarding_setup,
+        )
+
+        session = self._onboarding_session
+        if session is None or self.story_store is None or self._onboarding_reasoner is None:
+            return
+
+        normalized = normalize_onboarding_setup(session.normalized_setup, question_order=REQUIRED_ONBOARDING_FIELDS)
+
+        self.call_from_thread(self._set_onboarding_status, "onboarding: generating world lore...")
+        try:
+            bible = generate_story_bible(normalized, self._onboarding_reasoner.model)
+        except Exception:
+            logger.exception("story bible generation failed")
+            bible = None
+
+        if bible is not None and bible.lore:
+            self._onboarding_typewrite_lore(bible.lore)
+
+        seed_scene = build_onboarding_seed_scene(
+            normalized,
+            session_id=session.session_id,
+            onboarding_id=session.id,
+            bible=bible,
+        )
+        summary_text = (bible.intro_text if bible and bible.intro_text else None) or str(
+            seed_scene.get("summary_text") or ""
+        )
+        completed = self.story_store.complete_onboarding_session(
+            session.id,
+            normalized_setup=normalized,
+            generated_summary_text=summary_text,
+            seed_scene=seed_scene,
+        )
+        logger.info("onboarding complete session_id=%s", completed.session_id)
+        self.call_from_thread(self._onboarding_finish, completed.session_id, bible)
+
+    def _onboarding_finish(self, session_id: int, bible: StoryBible | None) -> None:
+        self._is_onboarding = False
+        self._onboarding_session = None
+        self.status_mode = "story"
+        self.status_message = "onboarding: starting your story..."
+        self._refresh_dashboard()
+        intro = bible.intro_text if bible else ""
+        self.run_worker(lambda: self._onboarding_boot_engine(session_id, intro), thread=True)
+
+    def _onboarding_boot_engine(self, session_id: int, intro_text: str) -> None:
+        from .engine import BaseReActEngine as _Engine
+
+        try:
+            self.engine = _Engine(
+                self._reasoner,
+                story_store=self.story_store,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.exception("engine boot after onboarding failed")
+            self.call_from_thread(self._show_error, RuntimeError("Failed to start game engine after onboarding"))
+            return
+
+        if intro_text:
+            self._onboarding_typewrite_chat(intro_text)
+
+        self.call_from_thread(self._onboarding_enter_game)
+
+    def _onboarding_typewrite_chat(self, text: str) -> None:
+        """Stream text word-by-word into chat as a Narrator message."""
+        chat_text = Text()
+        chat_text.append("Narrator", style="bold rgb(255,190,100)")
+        chat_text.append(": ", style="bright_black")
+        words = text.split()
+        buf = ""
+        for i, word in enumerate(words):
+            buf += ("" if i == 0 else " ") + word
+            current = Text()
+            current.append("Narrator", style="bold rgb(255,190,100)")
+            current.append(": ", style="bright_black")
+            current.append(buf, style="bright_white")
+            try:
+                chat = self.query_one("#chat", RichLog)
+                if i == 0:
+                    self.call_from_thread(chat.write, current)
+                else:
+                    # Clear and rewrite the last line by writing updated text
+                    self.call_from_thread(self._update_last_chat_line, current)
+            except Exception:
+                break
+            time.sleep(self.TYPEWRITER_WORD_DELAY)
+
+    def _update_last_chat_line(self, line: Text) -> None:
+        try:
+            chat = self.query_one("#chat", RichLog)
+            # RichLog doesn't support in-place edit; pop last and rewrite
+            if chat.lines:
+                chat.lines.pop()
+            chat.write(line)
+        except Exception:
+            pass
+
+    def _onboarding_enter_game(self) -> None:
+        self._refresh_story_cache()
+        self._update_engine_scene_viewport_hint()
+        cols, rows = self._llm_viewport_size()
+        self._last_redraw_size = (cols, rows)
+        self._refresh_dashboard()
+        # Auto-trigger first narrator turn so player sees opening scene
+        self.is_waiting_for_model = True
+        self.status_mode = "story"
+        self.status_message = "story: opening scene..."
+        self.spinner_index = 0
+        self.query_one("#player_input", Input).disabled = True
+        self._refresh_dashboard()
+        self.run_worker(self._onboarding_first_turn, thread=True)
+
+    def _onboarding_first_turn(self) -> None:
+        if self.engine is None:
+            self.call_from_thread(self._enable_player_input)
+            return
+        opening_prompt = "Narrate the opening scene. Describe where I am, who I am, and what I sense around me. Set the mood."
+        try:
+            self.call_from_thread(self._set_story_waiting_status, "story: opening scene...")
+            turn = self.engine.run_turn(opening_prompt)
+        except Exception as error:
+            logger.exception("opening turn failed")
+            self.call_from_thread(self._show_error, error)
+            return
+        self.call_from_thread(self._finish_onboarding_first_turn, turn)
+
+    def _finish_onboarding_first_turn(self, turn: EngineTurn) -> None:
+        self._append_chat("Narrator", turn.reply)
+        self._status_turn = self.engine.session.turn if self.engine else 0
+        if turn.scene_description:
+            self._scene_description = turn.scene_description
+        self._refresh_story_cache()
+        self.is_waiting_for_model = False
+        self.status_mode = "idle"
+        self.status_message = "ready"
+        self._refresh_dashboard()
+        cols, rows = self._llm_viewport_size()
+        self._last_redraw_size = (cols, rows)
+        self._start_map_stream({"cols": cols, "rows": rows})
+        self._enable_player_input()
 
 
 def render_scene_map(art: str, *, cols: int = 68, rows: int = 16) -> str:
@@ -712,6 +1030,16 @@ MAP_LEGEND_ITEMS: tuple[tuple[str, str], ...] = (
     ("~", "water"),
     ("=|+", "corridor"),
 )
+
+
+def _styled_lore_text(lore: str) -> Text:
+    text = Text()
+    text.append("WORLD LORE\n", style="bold bright_magenta")
+    if lore.strip():
+        text.append(lore.strip(), style="dim italic")
+    else:
+        text.append("Shaping your world...", style="dim bright_black")
+    return text
 
 
 def _styled_map_text(art: str) -> Text:

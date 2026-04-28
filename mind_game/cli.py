@@ -159,7 +159,10 @@ class OpenAICompatibleChatClient:
             "stream": stream,
         }
         if extra_payload is not None:
-            payload.update(dict(extra_payload))
+            merged = dict(extra_payload)
+            if "api.openai.com" in self.base_url:
+                merged.pop("chat_template_kwargs", None)
+            payload.update(merged)
         if stream and not os.environ.get("MIND_GAME_NO_STREAM_OPTIONS"):
             payload["stream_options"] = {"include_usage": True}
         return payload
@@ -604,22 +607,37 @@ def main() -> int:
     logger.info("app model selected model=%s base_url=%s", model_name, base_url)
 
     story_store = build_story_store()
+    use_tui = sys.stdout.isatty() and os.environ.get("MIND_GAME_LEGACY_CLI", "").lower() not in {"1", "true", "yes"}
     try:
-        story_session_id, onboarding_session = _resolve_story_session(story_store)
-        if story_store is not None and onboarding_session is not None:
-            story_session_id = _run_onboarding_chat(story_store, onboarding_session, onboarding_reasoner)
+        story_session_id, onboarding_session = _resolve_story_session(story_store, skip_interactive=use_tui)
 
-        engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
-
-        if sys.stdout.isatty() and os.environ.get("MIND_GAME_LEGACY_CLI", "").lower() not in {"1", "true", "yes"}:
+        if use_tui:
             try:
                 from .tui import MindGameApp
             except ModuleNotFoundError as error:  # pragma: no cover - depends on local install
                 print(f"Missing dependency: {error}. Install with `python -m pip install -e .`.")
                 return 1
 
-            MindGameApp(engine=engine, story_store=story_store, model_name=model_name, base_url=base_url).run()
+            if onboarding_session is not None:
+                engine = None
+            else:
+                engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
+
+            MindGameApp(
+                engine=engine,
+                reasoner=reasoner,
+                story_store=story_store,
+                model_name=model_name,
+                base_url=base_url,
+                onboarding_session=onboarding_session,
+                onboarding_reasoner=onboarding_reasoner,
+            ).run()
             return 0
+
+        if story_store is not None and onboarding_session is not None:
+            story_session_id = _run_onboarding_chat(story_store, onboarding_session, onboarding_reasoner)
+
+        engine = BaseReActEngine(reasoner, story_store=story_store, session_id=story_session_id)
 
         print(f'Mind Game chat loop ready using OpenAI-compatible backend model "{model_name}" at {base_url}.')
         print(f"Diagnostics log: {log_path}")
@@ -694,12 +712,18 @@ def main() -> int:
     return 0
 
 
-def _resolve_story_session(story_store: StoryStateStore | None) -> tuple[int | None, OnboardingSessionRecord | None]:
+def _resolve_story_session(
+    story_store: StoryStateStore | None,
+    *,
+    skip_interactive: bool = False,
+) -> tuple[int | None, OnboardingSessionRecord | None]:
     if story_store is None:
         return None, None
 
     onboarding_sessions = story_store.list_sessions(statuses=("onboarding",))
     if onboarding_sessions:
+        if skip_interactive:
+            return _auto_choose_onboarding_session(story_store, onboarding_sessions)
         return _choose_onboarding_session(story_store, onboarding_sessions)
 
     playable_session = story_store.latest_playable_session()
@@ -736,6 +760,21 @@ def _choose_onboarding_session(
                 break
         print("Please choose a listed session, press Enter, or type 'n'.")
 
+    onboarding_session = story_store.load_session_onboarding(selected_session.id)
+    if onboarding_session is None:
+        onboarding_session = story_store.create_onboarding_session(
+            selected_session.id,
+            question_order=REQUIRED_ONBOARDING_FIELDS,
+            status="in_progress",
+        )
+    return selected_session.id, onboarding_session
+
+
+def _auto_choose_onboarding_session(
+    story_store: StoryStateStore,
+    onboarding_sessions: Sequence[Any],
+) -> tuple[int | None, OnboardingSessionRecord | None]:
+    selected_session = onboarding_sessions[0]
     onboarding_session = story_store.load_session_onboarding(selected_session.id)
     if onboarding_session is None:
         onboarding_session = story_store.create_onboarding_session(

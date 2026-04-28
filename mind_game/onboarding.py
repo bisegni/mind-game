@@ -553,6 +553,7 @@ def build_onboarding_seed_scene(
     *,
     session_id: int | None = None,
     onboarding_id: int | None = None,
+    bible: "StoryBible | None" = None,
 ) -> dict[str, Any]:
     genre = _text(normalized_setup.get("genre"))
     tone = _text(normalized_setup.get("tone"))
@@ -600,7 +601,7 @@ def build_onboarding_seed_scene(
         "difficulty": difficulty,
     }
 
-    return {
+    seed: dict[str, Any] = {
         "scene_id": ":".join(scene_id_bits),
         "title": title_source,
         "summary_text": summary_text,
@@ -616,6 +617,20 @@ def build_onboarding_seed_scene(
         "onboarding_id": onboarding_id,
         "normalized_setup": dict(normalized_setup),
     }
+    if bible is not None:
+        if bible.lore:
+            seed["lore"] = bible.lore
+        if bible.intro_text:
+            seed["intro_text"] = bible.intro_text
+            seed["opening_prompt"] = bible.intro_text
+            seed["summary_text"] = bible.intro_text
+        if bible.story_lines:
+            seed["story_lines"] = bible.story_lines
+        if bible.key_npcs:
+            seed["key_npcs"] = bible.key_npcs
+        if bible.scene_description:
+            seed["scene_description"] = bible.scene_description
+    return seed
 
 
 def _infer_campaign_goal(
@@ -632,6 +647,80 @@ def _infer_campaign_goal(
     if any(word in haystack for word in ("horror", "haunted", "dark", "grim")):
         return "Survive the threat and learn what is haunting this world."
     return "Find out what is really happening and what the player should do next."
+
+
+@dataclass(frozen=True, slots=True)
+class StoryBible:
+    lore: str
+    intro_text: str
+    story_lines: list[Any]
+    key_npcs: list[Any]
+    scene_description: str
+
+
+STORY_BIBLE_SYSTEM_PROMPT = (
+    "You are a narrative designer for an interactive game. "
+    "Given a player's story setup, output ONLY valid JSON with this exact structure:\n"
+    '{"lore":"2-3 paragraphs of world background, history, factions, and atmosphere",'
+    '"intro_text":"Immersive opening narrator text (3-5 sentences) in second person that sets the scene",'
+    '"story_lines":[{"title":"arc title","hook":"one-sentence arc hook","tags":["tag"]}],'
+    '"key_npcs":[{"name":"name","role":"role","description":"one-line description"}],'
+    '"scene_description":"spatial description of the starting location for map generation"}\n'
+    "Rules: story_lines must be 3-5 possible arcs (not rails); key_npcs 2-4 characters; "
+    "intro_text starts with 'You'; match genre and tone strictly. Output JSON only, no prose."
+)
+
+
+def generate_story_bible(normalized_setup: Mapping[str, Any], client: Any) -> StoryBible:
+    from .diagnostics import get_logger as _get_logger
+
+    _logger = _get_logger(__name__)
+    setup_summary = {
+        key: normalized_setup.get(key)
+        for key in ("genre", "tone", "setting", "player_role", "campaign_goal", "difficulty", "world_tags", "story_promises")
+        if normalized_setup.get(key)
+    }
+    prompt = f"Generate a story bible for this setup: {json.dumps(setup_summary, sort_keys=True)}"
+    messages = [
+        {"role": "system", "content": STORY_BIBLE_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        response = client.invoke(messages)
+        raw = _strip_thinking_tags(response.content).strip()
+        brace = raw.find("{")
+        if brace != -1:
+            raw = raw[brace:]
+        payload = json.loads(raw)
+    except Exception as exc:
+        _logger.warning("story bible generation failed: %s", exc)
+        payload = {}
+
+    lore = str(payload.get("lore") or "").strip()
+    intro_text = str(payload.get("intro_text") or "").strip()
+    story_lines = payload.get("story_lines") or []
+    key_npcs = payload.get("key_npcs") or []
+    scene_description = str(payload.get("scene_description") or "").strip()
+
+    if not isinstance(story_lines, list):
+        story_lines = []
+    if not isinstance(key_npcs, list):
+        key_npcs = []
+
+    _logger.info(
+        "story bible generated lore_chars=%d intro_chars=%d arcs=%d npcs=%d",
+        len(lore),
+        len(intro_text),
+        len(story_lines),
+        len(key_npcs),
+    )
+    return StoryBible(
+        lore=lore,
+        intro_text=intro_text,
+        story_lines=story_lines,
+        key_npcs=key_npcs,
+        scene_description=scene_description,
+    )
 
 
 def _infer_story_promises(

@@ -1073,7 +1073,7 @@ class StoryStateStore:
         if not seed_scene:
             return {}
 
-        return {
+        compact: dict[str, Any] = {
             "onboarding_id": onboarding.id,
             "session_id": onboarding.session_id,
             "scene_id": seed_scene.get("scene_id"),
@@ -1082,6 +1082,7 @@ class StoryStateStore:
                 or seed_scene.get("summary_text")
                 or "",
             ),
+            "scene_description": str(seed_scene.get("scene_description") or ""),
             "facts": dict(seed_scene.get("facts", {})),
             "world_tags": list(seed_scene.get("world_tags", [])),
             "story_promises": list(seed_scene.get("story_promises", [])),
@@ -1089,6 +1090,13 @@ class StoryStateStore:
             "memory_seed": dict(seed_scene.get("memory_seed", {})),
             "normalized_setup": dict(onboarding.normalized_setup),
         }
+        if seed_scene.get("lore"):
+            compact["lore"] = seed_scene["lore"]
+        if seed_scene.get("story_lines"):
+            compact["story_lines"] = seed_scene["story_lines"]
+        if seed_scene.get("key_npcs"):
+            compact["key_npcs"] = seed_scene["key_npcs"]
+        return compact
 
     def upsert_entity(
         self,
