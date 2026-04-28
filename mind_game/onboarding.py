@@ -658,69 +658,228 @@ class StoryBible:
     scene_description: str
 
 
-STORY_BIBLE_SYSTEM_PROMPT = (
-    "You are a narrative designer for an interactive game. "
-    "Given a player's story setup, output ONLY valid JSON with this exact structure:\n"
-    '{"lore":"2-3 paragraphs of world background, history, factions, and atmosphere",'
-    '"intro_text":"Immersive opening narrator text (3-5 sentences) in second person that sets the scene",'
-    '"story_lines":[{"title":"arc title","hook":"one-sentence arc hook","tags":["tag"]}],'
-    '"key_npcs":[{"name":"name","role":"role","description":"one-line description"}],'
-    '"scene_description":"spatial description of the starting location for map generation"}\n'
-    "Rules: story_lines must be 3-5 possible arcs (not rails); key_npcs 2-4 characters; "
-    "intro_text starts with 'You'; match genre and tone strictly. Output JSON only, no prose."
+STORY_CREATION_SYSTEM_PROMPT = (
+    "You are a narrative architect building a story bible for an interactive text game.\n"
+    "Use the tools listed in the current state to build the world. Each tool may only be used the allowed number of times.\n"
+    "RULES:\n"
+    "- story.write_lore: call EXACTLY ONCE. Already done if lore is present in state.\n"
+    "- story.add_arc: call 3 to 5 times total. Stop adding arcs once you have 3-5.\n"
+    "- story.add_npc: call 2 to 4 times total. Stop adding NPCs once you have 2-4.\n"
+    "- story.set_scene: call EXACTLY ONCE. Already done if scene_description is present.\n"
+    "- Return final JSON only when ALL required tools have been called (lore written, 3+ arcs, 2+ npcs, scene set).\n"
+    "- DO NOT call a tool that is not listed in available_tools.\n"
+    "- DO NOT repeat a one-shot tool (story.write_lore, story.set_scene) if it is absent from available_tools.\n"
+    "Tool call format: {\"kind\":\"tool\",\"tool\":\"<name>\",\"arguments\":{...}}\n"
+    "Final format: {\"kind\":\"final\",\"content\":\"<immersive 3-5 sentence opening in second person, start with You>\","
+    "\"scene_description\":\"<spatial starting location description for ASCII map>\"}"
 )
 
+_LORE_TOOL = ("story.write_lore", "Write world background (lore), history, factions. Call ONCE. args: {text: str}")
+_ARC_TOOL = ("story.add_arc", "Add one story arc. Call 3-5 times. args: {title: str, hook: str, tags: list[str]}")
+_NPC_TOOL = ("story.add_npc", "Add one key NPC. Call 2-4 times. args: {name: str, role: str, description: str}")
+_SCENE_TOOL = ("story.set_scene", "Set starting scene spatial description. Call ONCE. args: {description: str}")
 
-def generate_story_bible(normalized_setup: Mapping[str, Any], client: Any) -> StoryBible:
+
+class _StoryAccumulator:
+    def __init__(self) -> None:
+        self.lore: str = ""
+        self.arcs: list[dict[str, Any]] = []
+        self.npcs: list[dict[str, Any]] = []
+        self.scene_description: str = ""
+
+    def available_tools(self) -> list[tuple[str, str]]:
+        tools = []
+        if not self.lore:
+            tools.append(_LORE_TOOL)
+        if len(self.arcs) < 5:
+            tools.append(_ARC_TOOL)
+        if len(self.npcs) < 4:
+            tools.append(_NPC_TOOL)
+        if not self.scene_description:
+            tools.append(_SCENE_TOOL)
+        return tools
+
+    def is_complete(self) -> bool:
+        return bool(self.lore) and len(self.arcs) >= 3 and len(self.npcs) >= 2 and bool(self.scene_description)
+
+    def apply(self, tool_name: str, arguments: Mapping[str, Any]) -> str:
+        if tool_name == "story.write_lore":
+            if self.lore:
+                return "IGNORED: lore already written — do NOT call story.write_lore again"
+            self.lore = str(arguments.get("text") or "").strip()
+            return f"lore stored ({len(self.lore)} chars) — next: call story.add_arc"
+        if tool_name == "story.add_arc":
+            if len(self.arcs) >= 5:
+                return "IGNORED: already have 5 arcs — call story.add_npc or story.set_scene"
+            arc = {
+                "title": str(arguments.get("title") or ""),
+                "hook": str(arguments.get("hook") or ""),
+                "tags": list(arguments.get("tags") or []),
+            }
+            self.arcs.append(arc)
+            remaining = 5 - len(self.arcs)
+            if len(self.arcs) >= 3:
+                return f"arc '{arc['title']}' added ({len(self.arcs)} arcs total) — you may add {remaining} more or proceed to story.add_npc"
+            return f"arc '{arc['title']}' added ({len(self.arcs)} arcs total) — need {3 - len(self.arcs)} more arcs minimum"
+        if tool_name == "story.add_npc":
+            if len(self.npcs) >= 4:
+                return "IGNORED: already have 4 NPCs — call story.set_scene"
+            npc = {
+                "name": str(arguments.get("name") or ""),
+                "role": str(arguments.get("role") or ""),
+                "description": str(arguments.get("description") or ""),
+            }
+            self.npcs.append(npc)
+            if len(self.npcs) >= 2:
+                return f"npc '{npc['name']}' added ({len(self.npcs)} npcs total) — you may add more or proceed to story.set_scene"
+            return f"npc '{npc['name']}' added ({len(self.npcs)} npcs total) — need {2 - len(self.npcs)} more NPC minimum"
+        if tool_name == "story.set_scene":
+            if self.scene_description:
+                return "IGNORED: scene already set — do NOT call story.set_scene again. Return final now."
+            self.scene_description = str(arguments.get("description") or "").strip()
+            return "scene set — all tools complete. Return final JSON now."
+        return f"unknown tool: {tool_name}"
+
+    def to_snapshot(self, setup: Mapping[str, Any]) -> dict[str, Any]:
+        snap: dict[str, Any] = {
+            "task": "story_creation",
+            "setup": {
+                key: setup.get(key)
+                for key in ("genre", "tone", "setting", "player_role", "campaign_goal", "difficulty", "world_tags")
+                if setup.get(key)
+            },
+            "state": {
+                "lore": self.lore[:300] + "..." if len(self.lore) > 300 else self.lore,
+                "arcs_count": len(self.arcs),
+                "arcs": self.arcs,
+                "npcs_count": len(self.npcs),
+                "npcs": self.npcs,
+                "scene_description": self.scene_description[:200] + "..." if len(self.scene_description) > 200 else self.scene_description,
+            },
+            "available_tools": [{"name": n, "description": d} for n, d in self.available_tools()],
+            "ready_for_final": self.is_complete(),
+        }
+        return snap
+
+    def to_bible(self, intro_text: str) -> "StoryBible":
+        return StoryBible(
+            lore=self.lore,
+            intro_text=intro_text,
+            story_lines=self.arcs,
+            key_npcs=self.npcs,
+            scene_description=self.scene_description,
+        )
+
+
+def _parse_story_decision(content: str) -> tuple[str, str | None, dict[str, Any]]:
+    """Return (kind, tool_name, arguments). kind is 'tool' or 'final'."""
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[^\n]*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text).strip()
+    brace = text.find("{")
+    if brace == -1:
+        return "final", None, {"content": text}
+    text = text[brace:]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return "final", None, {"content": content.strip()}
+    if not isinstance(payload, dict):
+        return "final", None, {"content": content.strip()}
+    kind = str(payload.get("kind") or "final").lower()
+    if kind == "tool":
+        tool_name = str(payload.get("tool") or "").strip()
+        args = payload.get("arguments") or payload.get("args") or {}
+        return "tool", tool_name, dict(args) if isinstance(args, Mapping) else {}
+    final_content = str(payload.get("content") or content).strip()
+    return "final", None, {"content": final_content}
+
+
+def run_story_creation(
+    normalized_setup: Mapping[str, Any],
+    client: Any,
+    *,
+    max_steps: int = 16,
+    on_tool: "Callable[[str, str, _StoryAccumulator], None] | None" = None,
+) -> StoryBible:
+    """Run a full ReAct agentic loop to build a story bible. Returns StoryBible."""
+    from typing import Callable
     from .diagnostics import get_logger as _get_logger
 
     _logger = _get_logger(__name__)
-    setup_summary = {
-        key: normalized_setup.get(key)
-        for key in ("genre", "tone", "setting", "player_role", "campaign_goal", "difficulty", "world_tags", "story_promises")
-        if normalized_setup.get(key)
+    acc = _StoryAccumulator()
+
+    for step in range(max_steps):
+        if acc.is_complete():
+            _logger.info("story creation complete at step=%d", step)
+            break
+
+        snapshot = acc.to_snapshot(normalized_setup)
+        prompt = f"Current story state:\n{json.dumps(snapshot, sort_keys=True)}\nCall the next available tool."
+        messages = [
+            {"role": "system", "content": STORY_CREATION_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = client.invoke(messages)
+            raw = _strip_thinking_tags(response.content).strip()
+        except Exception as exc:
+            _logger.warning("story creation step %d failed: %s", step, exc)
+            break
+
+        kind, tool_name, payload = _parse_story_decision(raw)
+        _logger.info("story creation step=%d kind=%s tool=%s available=%s", step, kind, tool_name, [t[0] for t in acc.available_tools()])
+
+        if tool_name:
+            allowed = {t[0] for t in acc.available_tools()}
+            if tool_name not in allowed:
+                _logger.warning("story tool %s not allowed (available=%s) — skipping", tool_name, allowed)
+                continue
+            result = acc.apply(tool_name, payload)
+            _logger.info("story tool %s -> %s", tool_name, result)
+            if on_tool is not None:
+                try:
+                    on_tool(tool_name, result, acc)
+                except Exception:
+                    pass
+
+    # Separate dedicated call to generate intro text — never mixed into the tool loop
+    intro_text = _generate_intro_text(acc, normalized_setup, client)
+    _logger.info("story bible done lore=%d arcs=%d npcs=%d intro=%d", len(acc.lore), len(acc.arcs), len(acc.npcs), len(intro_text))
+    return acc.to_bible(intro_text)
+
+
+_INTRO_SYSTEM_PROMPT = (
+    "You are a narrator for an interactive text game. "
+    "Write an immersive opening paragraph (3-5 sentences) in second person (starting with 'You') "
+    "that places the player in the world. Match the genre, tone, and setting exactly. "
+    "Output ONLY the narrator prose — no JSON, no labels, no commentary."
+)
+
+
+def _generate_intro_text(acc: _StoryAccumulator, setup: Mapping[str, Any], client: Any) -> str:
+    from .diagnostics import get_logger as _get_logger
+
+    _logger = _get_logger(__name__)
+    context = {
+        "setup": {k: setup.get(k) for k in ("genre", "tone", "setting", "player_role") if setup.get(k)},
+        "lore_summary": acc.lore[:500] if acc.lore else "",
+        "arcs": acc.arcs[:3],
+        "scene_description": acc.scene_description[:200] if acc.scene_description else "",
     }
-    prompt = f"Generate a story bible for this setup: {json.dumps(setup_summary, sort_keys=True)}"
-    messages = [
-        {"role": "system", "content": STORY_BIBLE_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
+    prompt = f"Write the opening narrator text for this world:\n{json.dumps(context, sort_keys=True)}"
     try:
-        response = client.invoke(messages)
-        raw = _strip_thinking_tags(response.content).strip()
-        brace = raw.find("{")
-        if brace != -1:
-            raw = raw[brace:]
-        payload = json.loads(raw)
+        response = client.invoke([
+            {"role": "system", "content": _INTRO_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ])
+        intro = _strip_thinking_tags(response.content).strip()
+        _logger.info("intro generation done chars=%d", len(intro))
+        return intro
     except Exception as exc:
-        _logger.warning("story bible generation failed: %s", exc)
-        payload = {}
-
-    lore = str(payload.get("lore") or "").strip()
-    intro_text = str(payload.get("intro_text") or "").strip()
-    story_lines = payload.get("story_lines") or []
-    key_npcs = payload.get("key_npcs") or []
-    scene_description = str(payload.get("scene_description") or "").strip()
-
-    if not isinstance(story_lines, list):
-        story_lines = []
-    if not isinstance(key_npcs, list):
-        key_npcs = []
-
-    _logger.info(
-        "story bible generated lore_chars=%d intro_chars=%d arcs=%d npcs=%d",
-        len(lore),
-        len(intro_text),
-        len(story_lines),
-        len(key_npcs),
-    )
-    return StoryBible(
-        lore=lore,
-        intro_text=intro_text,
-        story_lines=story_lines,
-        key_npcs=key_npcs,
-        scene_description=scene_description,
-    )
+        _logger.warning("intro generation failed: %s", exc)
+        return ""
 
 
 def _infer_story_promises(

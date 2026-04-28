@@ -640,7 +640,8 @@ class MindGameApp(App[None]):
     # ------------------------------------------------------------------
 
     def _onboarding_typewrite_lore(self, text: str) -> None:
-        """Append text word-by-word into the map/situation area."""
+        """Stream text word-by-word into the map/situation area (replaces current lore)."""
+        self._onboarding_lore_text = ""
         for word in text.split():
             self._onboarding_lore_text += word + " "
             self.call_from_thread(self._refresh_dashboard)
@@ -761,12 +762,34 @@ class MindGameApp(App[None]):
         input_widget.disabled = True
         self.run_worker(self._onboarding_generate_bible, thread=True)
 
+    def _onboarding_on_story_tool(self, tool_name: str, result: str, acc: Any) -> None:
+        """Called from story creation worker on each tool completion."""
+        label = {
+            "story.write_lore": "onboarding: world lore written",
+            "story.add_arc": f"onboarding: arc added ({result})",
+            "story.add_npc": f"onboarding: npc added ({result})",
+            "story.set_scene": "onboarding: opening scene set",
+        }.get(tool_name, f"onboarding: {tool_name}")
+        self.call_from_thread(self._set_onboarding_status, label)
+        if tool_name == "story.write_lore" and acc.lore:
+            self._onboarding_typewrite_lore(acc.lore)
+        elif tool_name == "story.add_arc" and acc.arcs:
+            arc = acc.arcs[-1]
+            line = f"\n[Arc] {arc.get('title', '')}: {arc.get('hook', '')}"
+            self._onboarding_lore_text += line
+            self.call_from_thread(self._refresh_dashboard)
+        elif tool_name == "story.add_npc" and acc.npcs:
+            npc = acc.npcs[-1]
+            line = f"\n[NPC] {npc.get('name', '')} — {npc.get('description', '')}"
+            self._onboarding_lore_text += line
+            self.call_from_thread(self._refresh_dashboard)
+
     def _onboarding_generate_bible(self) -> None:
         from .onboarding import (
             REQUIRED_ONBOARDING_FIELDS,
             build_onboarding_seed_scene,
-            generate_story_bible,
             normalize_onboarding_setup,
+            run_story_creation,
         )
 
         session = self._onboarding_session
@@ -775,15 +798,16 @@ class MindGameApp(App[None]):
 
         normalized = normalize_onboarding_setup(session.normalized_setup, question_order=REQUIRED_ONBOARDING_FIELDS)
 
-        self.call_from_thread(self._set_onboarding_status, "onboarding: generating world lore...")
+        self.call_from_thread(self._set_onboarding_status, "onboarding: building story world...")
         try:
-            bible = generate_story_bible(normalized, self._onboarding_reasoner.model)
+            bible = run_story_creation(
+                normalized,
+                self._onboarding_reasoner.model,
+                on_tool=self._onboarding_on_story_tool,
+            )
         except Exception:
-            logger.exception("story bible generation failed")
+            logger.exception("story creation failed")
             bible = None
-
-        if bible is not None and bible.lore:
-            self._onboarding_typewrite_lore(bible.lore)
 
         seed_scene = build_onboarding_seed_scene(
             normalized,
@@ -832,36 +856,30 @@ class MindGameApp(App[None]):
         self.call_from_thread(self._onboarding_enter_game)
 
     def _onboarding_typewrite_chat(self, text: str) -> None:
-        """Stream text word-by-word into chat as a Narrator message."""
-        chat_text = Text()
-        chat_text.append("Narrator", style="bold rgb(255,190,100)")
-        chat_text.append(": ", style="bright_black")
+        """Stream intro text into chat using a Static overlay that updates word-by-word."""
         words = text.split()
         buf = ""
         for i, word in enumerate(words):
             buf += ("" if i == 0 else " ") + word
-            current = Text()
-            current.append("Narrator", style="bold rgb(255,190,100)")
-            current.append(": ", style="bright_black")
-            current.append(buf, style="bright_white")
-            try:
-                chat = self.query_one("#chat", RichLog)
-                if i == 0:
-                    self.call_from_thread(chat.write, current)
-                else:
-                    # Clear and rewrite the last line by writing updated text
-                    self.call_from_thread(self._update_last_chat_line, current)
-            except Exception:
-                break
+            self.call_from_thread(self._set_intro_preview, buf)
             time.sleep(self.TYPEWRITER_WORD_DELAY)
+        # Commit final complete text as a proper chat line
+        self.call_from_thread(self._commit_intro_preview, buf)
 
-    def _update_last_chat_line(self, line: Text) -> None:
+    def _set_intro_preview(self, text: str) -> None:
         try:
-            chat = self.query_one("#chat", RichLog)
-            # RichLog doesn't support in-place edit; pop last and rewrite
-            if chat.lines:
-                chat.lines.pop()
-            chat.write(line)
+            desc = self.query_one("#scene_description", Static)
+            preview = Text()
+            preview.append("INTRO  ", style="bold bright_magenta")
+            preview.append(text, style="bright_white italic")
+            desc.update(preview)
+        except Exception:
+            pass
+
+    def _commit_intro_preview(self, text: str) -> None:
+        try:
+            self._append_chat("Narrator", text)
+            self._refresh_dashboard()
         except Exception:
             pass
 
